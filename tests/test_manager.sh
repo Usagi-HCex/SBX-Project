@@ -104,12 +104,17 @@ apt-get() {
   printf 'apt-get %s\n' "$*" >>"$warp_log"
 }
 apt-cache() {
-  printf 'cloudflare-warp:\n  Candidate: 2026.1.150.0\n'
+  printf 'apt-cache %s\n' "$*" >>"$warp_log"
+  return 1
 }
 install_warp_package
 grep -F 'https://pkg.cloudflareclient.com/ noble main' "$SBX_WARP_REPO_FILE" >/dev/null
 grep -F 'apt-get update -o Dir::Etc::sourcelist=' "$warp_log" >/dev/null
 grep -F 'apt-get install -y cloudflare-warp' "$warp_log" >/dev/null
+if grep -F 'apt-cache ' "$warp_log" >/dev/null; then
+  printf 'WARP installation unexpectedly depended on apt-cache policy\n' >&2
+  exit 1
+fi
 [[ -s "$SBX_WARP_KEYRING" ]]
 
 printf 'Manager shell tests passed.\n'

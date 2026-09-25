@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="0.1.6"
+VERSION="0.1.7"
 ETC_DIR="${SBX_ETC_DIR:-/etc/sbx-manager}"
 STATE_FILE="$ETC_DIR/state.json"
 CERT_DIR="$ETC_DIR/certs"
@@ -1835,7 +1835,7 @@ EOF
 }
 
 install_warp_package() {
-  local codename tmp key_source keyring source_fingerprints keyring_fingerprints candidate os_release
+  local codename tmp key_source keyring source_fingerprints keyring_fingerprints os_release
   local repo_file system_keyring had_repo=0 had_keyring=0
   command -v apt-get >/dev/null 2>&1 || { warn "官方 cloudflare-warp 自动安装目前仅支持 Debian/Ubuntu。"; return 1; }
   if ! command -v gpg >/dev/null 2>&1; then
@@ -1894,16 +1894,6 @@ install_warp_package() {
     if ((had_keyring)); then install -m 644 "$tmp/keyring.backup" "$system_keyring"; else rm -f -- "$system_keyring"; fi
     rm -rf -- "$tmp"
     warn "Cloudflare 软件源签名验证失败，已恢复原仓库配置。"
-    return 1
-  fi
-  if ! candidate=$(apt-cache policy cloudflare-warp | awk '/Candidate:/ {print $2; exit}'); then
-    rm -rf -- "$tmp"
-    warn "无法读取 cloudflare-warp 软件包候选版本。"
-    return 1
-  fi
-  if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
-    rm -rf -- "$tmp"
-    warn "Cloudflare 软件源中没有适用于当前系统架构的 cloudflare-warp 包。"
     return 1
   fi
   if ! apt-get install -y cloudflare-warp; then
