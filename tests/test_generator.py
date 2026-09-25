@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import json
 import pathlib
@@ -34,6 +35,8 @@ def sample_state():
             "port": 18080,
             "uuid": "22222222-2222-4222-8222-222222222222",
             "path": "/vmess",
+            "tls": True,
+            "cipher": "chacha20-poly1305",
         },
         "sb-hysteria2": {"port": 24444, "password": "hy2-pass"},
         "sb-tuic": {
@@ -45,13 +48,16 @@ def sample_state():
         "sb-shadowsocks": {
             "port": 24447,
             "method": "2022-blake3-aes-128-gcm",
-            "password": "c2l4dGVlbi1ieXRlcyE=",
+            "password": "MDEyMzQ1Njc4OWFiY2RlZg==",
         },
         "xr-vless-reality": {**reality, "port": 34443},
         "xr-vless-ws": {
             "port": 28080,
             "uuid": "44444444-4444-4444-8444-444444444444",
             "path": "/vless",
+            "tls": True,
+            "decryption": "server-vless-encryption",
+            "encryption": "client-vless-encryption",
         },
         "xr-vmess-ws": {
             "port": 28081,
@@ -63,7 +69,7 @@ def sample_state():
         "xr-shadowsocks": {
             "port": 34446,
             "method": "2022-blake3-aes-128-gcm",
-            "password": "YW5vdGhlci0xNmJ5dGU=",
+            "password": "ZmVkY2JhOTg3NjU0MzIxMA==",
         },
     }
     return state
@@ -132,10 +138,91 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(xray["outbounds"][0]["tag"], "direct")
         anytls = next(item for item in sing["inbounds"] if item["tag"] == "sb-anytls")
         self.assertEqual(anytls["tls"]["certificate_path"], "/etc/sbx-manager/certs/fullchain.pem")
+        self.assertEqual(anytls["padding_scheme"][0], "stop=8")
+        hysteria2 = next(item for item in sing["inbounds"] if item["tag"] == "sb-hysteria2")
+        self.assertFalse(hysteria2["ignore_client_bandwidth"])
+        self.assertFalse(hysteria2["disable_path_mtu_discovery"])
+        tuic = next(item for item in sing["inbounds"] if item["tag"] == "sb-tuic")
+        self.assertEqual(tuic["auth_timeout"], "3s")
+        self.assertEqual(tuic["heartbeat"], "10s")
+        self.assertFalse(tuic["zero_rtt_handshake"])
         xhttp = next(item for item in xray["inbounds"] if item["tag"] == "xr-vless-xhttp-reality")
         self.assertEqual(xhttp["streamSettings"]["network"], "xhttp")
         xray_ss = next(item for item in xray["inbounds"] if item["tag"] == "xr-shadowsocks")
         self.assertEqual(xray_ss["settings"]["network"], "tcp,udp")
+        sb_vmess = next(item for item in sing["inbounds"] if item["tag"] == "sb-vmess-ws")
+        self.assertTrue(sb_vmess["tls"]["enabled"])
+        xr_vless = next(item for item in xray["inbounds"] if item["tag"] == "xr-vless-ws")
+        self.assertEqual(xr_vless["streamSettings"]["security"], "tls")
+        self.assertEqual(xr_vless["settings"]["decryption"], "server-vless-encryption")
+        self.assertEqual(xr_vless["settings"]["clients"][0]["flow"], "xtls-rprx-vision")
+
+    def test_optional_fields_are_backward_compatible(self):
+        state = sample_state()
+        for protocol_id in ("sb-vmess-ws", "xr-vless-ws"):
+            state["protocols"][protocol_id].pop("tls", None)
+        state["protocols"]["sb-vmess-ws"].pop("cipher", None)
+        state["protocols"]["xr-vless-ws"].pop("decryption", None)
+        state["protocols"]["xr-vless-ws"].pop("encryption", None)
+        GEN.validate_state(state)
+        self.assertNotIn(
+            "tls",
+            next(
+                item for item in GEN.build_singbox(state)["inbounds"]
+                if item["tag"] == "sb-vmess-ws"
+            ),
+        )
+
+    def test_vless_encryption_is_xray_only_and_exported(self):
+        state = sample_state()
+        link = GEN.share_link("xr-vless-ws", state["protocols"]["xr-vless-ws"], state)
+        params = urllib.parse.parse_qs(urllib.parse.urlsplit(link).query)
+        self.assertEqual(params["encryption"], ["client-vless-encryption"])
+        self.assertEqual(params["flow"], ["xtls-rprx-vision"])
+        state["protocols"]["sb-vless-reality"]["decryption"] = "server"
+        state["protocols"]["sb-vless-reality"]["encryption"] = "client"
+        with self.assertRaises(GEN.StateError):
+            GEN.validate_state(state)
+
+    def test_reality_options_and_hysteria_tuning_render(self):
+        state = sample_state()
+        state["protocols"]["xr-vless-reality"].update(
+            {"handshake_port": 8443, "fingerprint": "firefox"}
+        )
+        state["protocols"]["sb-hysteria2"].update(
+            {"up_mbps": 100, "down_mbps": 500, "bbr_profile": "aggressive"}
+        )
+        GEN.validate_state(state)
+        xr_inbound = next(
+            item for item in GEN.build_xray(state)["inbounds"]
+            if item["tag"] == "xr-vless-reality"
+        )
+        self.assertEqual(
+            xr_inbound["streamSettings"]["realitySettings"]["target"],
+            "www.microsoft.com:8443",
+        )
+        link = GEN.share_link(
+            "xr-vless-reality", state["protocols"]["xr-vless-reality"], state
+        )
+        self.assertEqual(
+            urllib.parse.parse_qs(urllib.parse.urlsplit(link).query)["fp"],
+            ["firefox"],
+        )
+        hy2 = next(
+            item for item in GEN.build_singbox(state)["inbounds"]
+            if item["tag"] == "sb-hysteria2"
+        )
+        self.assertEqual(hy2["up_mbps"], 100)
+        self.assertEqual(hy2["down_mbps"], 500)
+        self.assertEqual(hy2["bbr_profile"], "aggressive")
+
+    def test_direct_websocket_tls_and_vmess_cipher_are_exported(self):
+        state = sample_state()
+        vmess = GEN.share_link("sb-vmess-ws", state["protocols"]["sb-vmess-ws"], state)
+        payload = json.loads(base64.b64decode(vmess.removeprefix("vmess://")))
+        self.assertEqual(payload["tls"], "tls")
+        self.assertEqual(payload["sni"], "edge.example.com")
+        self.assertEqual(payload["scy"], "chacha20-poly1305")
 
     def test_hysteria2_hopping_obfs_and_firewall_plan(self):
         state = sample_state()

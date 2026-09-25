@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="0.1.7"
+VERSION="0.1.8"
 ETC_DIR="${SBX_ETC_DIR:-/etc/sbx-manager}"
 STATE_FILE="$ETC_DIR/state.json"
 CERT_DIR="$ETC_DIR/certs"
@@ -109,6 +109,19 @@ random_port() {
   return 1
 }
 
+random_hopping_range() {
+  local start end i
+  for ((i=0; i<100; i++)); do
+    start=$(shuf -i 10000-59000 -n 1)
+    end=$((start + 999))
+    if ! hopping_range_conflicts "$start" "$end" "0"; then
+      printf '%s %s' "$start" "$end"
+      return 0
+    fi
+  done
+  return 1
+}
+
 prompt_port() {
   local suggested answer
   suggested=$(random_port) || die "无法找到空闲端口。"
@@ -157,10 +170,12 @@ hopping_range_conflicts() {
 }
 
 prompt_hopping_range() {
-  local base_port=$1 start end
+  local base_port=$1 start end suggested_start suggested_end suggested
+  suggested=$(random_hopping_range) || { warn "无法找到可用的随机 UDP 跳跃端口范围。"; return 1; }
+  read -r suggested_start suggested_end <<<"$suggested"
   while true; do
-    start=$(prompt "Hy2 跳跃起始 UDP 端口" "20000")
-    end=$(prompt "Hy2 跳跃结束 UDP 端口" "30000")
+    start=$(prompt "Hy2 跳跃起始 UDP 端口" "$suggested_start")
+    end=$(prompt "Hy2 跳跃结束 UDP 端口" "$suggested_end")
     if ! is_valid_port "$start" || ! is_valid_port "$end" || ((10#$start >= 10#$end)); then
       warn "端口跳跃范围必须是 1-65535 内从小到大的两个端口。"
     elif hopping_range_conflicts "$start" "$end" "$base_port"; then
@@ -328,20 +343,36 @@ install_xray() {
 }
 
 install_cloudflared() {
-  local tag arch asset url tmp
-  tag=${1:-${SBX_CLOUDFLARED_VERSION:-}}
-  [[ -n "$tag" ]] || tag=$(github_latest_tag cloudflare/cloudflared)
+  local requested_tag release_json tag arch asset tmp
+  requested_tag=${1:-${SBX_CLOUDFLARED_VERSION:-}}
+  if ! release_json=$(github_release_json cloudflare/cloudflared "$requested_tag"); then
+    return 1
+  fi
+  tag=$(jq -er '.tag_name' <<<"$release_json") \
+    || { warn "cloudflared Release 缺少版本标签。"; return 1; }
   case $(uname -m) in
     x86_64|amd64) arch=amd64 ;;
     aarch64|arm64) arch=arm64 ;;
-    *) die "cloudflared 暂不支持当前架构：$(uname -m)" ;;
+    *) warn "cloudflared 暂不支持当前架构：$(uname -m)"; return 1 ;;
   esac
   asset="cloudflared-linux-${arch}"
-  url="https://github.com/cloudflare/cloudflared/releases/download/${tag}/${asset}"
   tmp=$(mktemp)
   info "从 Cloudflare 官方发布页下载 cloudflared $tag"
-  secure_curl -o "$tmp" "$url"
-  install -m 755 "$tmp" "$CF_BIN"
+  if ! download_verified_release_asset cloudflare/cloudflared "$asset" "$tmp" <<<"$release_json"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 700 "$tmp"
+  if ! "$tmp" --version >/dev/null 2>&1; then
+    rm -f -- "$tmp"
+    warn "下载的 cloudflared 无法在当前系统运行。"
+    return 1
+  fi
+  if ! install -m 755 "$tmp" "$CF_BIN"; then
+    rm -f -- "$tmp"
+    warn "无法安装 cloudflared 到 $CF_BIN。"
+    return 1
+  fi
   rm -f -- "$tmp"
   ok "cloudflared 已安装：$($CF_BIN --version)"
 }
@@ -707,6 +738,35 @@ new_password() {
   openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-'
 }
 
+new_transport_path() {
+  printf '/%s' "$(openssl rand -hex 18)"
+}
+
+generate_vless_encryption_record() {
+  local authentication=${1:-x25519} output index decryption encryption
+  local -a decryptions=() encryptions=()
+  if ! output=$($XR_BIN vlessenc 2>/dev/null); then
+    warn "当前 Xray 内核不支持生成 VLESS Encryption 参数；请先更新 Xray。"
+    return 1
+  fi
+  mapfile -t decryptions < <(awk -F'"' '$2 == "decryption" {print $4}' <<<"$output")
+  mapfile -t encryptions < <(awk -F'"' '$2 == "encryption" {print $4}' <<<"$output")
+  ((${#decryptions[@]} >= 2 && ${#encryptions[@]} >= 2)) || {
+    warn "无法从 xray vlessenc 输出中解析两组 VLESS Encryption 参数。"
+    return 1
+  }
+  case "$authentication" in
+    x25519) index=0 ;;
+    mlkem768) index=1 ;;
+    *) warn "未知 VLESS Encryption 认证方式。"; return 1 ;;
+  esac
+  decryption=${decryptions[$index]}
+  encryption=${encryptions[$index]}
+  [[ -n "$decryption" && -n "$encryption" ]] || { warn "VLESS Encryption 参数为空。"; return 1; }
+  jq -cn --arg decryption "$decryption" --arg encryption "$encryption" --arg authentication "$authentication" \
+    '{decryption:$decryption,encryption:$encryption,vless_encryption_auth:$authentication}'
+}
+
 certificate_ready() {
   local domain fullchain key
   domain=$(jq -r '.certificate.domain' "$STATE_FILE")
@@ -772,27 +832,31 @@ protocol_id_from_choice() {
 }
 
 make_reality_record() {
-  local protocol_id=$1 port=$2 uuid=$3 server_name=$4 output private public short_id path=${5:-}
+  local protocol_id=$1 port=$2 uuid=$3 server_name=$4 handshake_port=$5 fingerprint=$6
+  local output private public short_id path=${7:-}
   if [[ "$protocol_id" == sb-* ]]; then
-    output=$($SB_BIN generate reality-keypair)
+    output=$($SB_BIN generate reality-keypair) || { warn "Sing-box Reality 密钥生成失败。"; return 1; }
   else
-    output=$($XR_BIN x25519)
+    output=$($XR_BIN x25519) || { warn "Xray Reality 密钥生成失败。"; return 1; }
   fi
-  private=$(awk -F: '/PrivateKey/ {gsub(/[[:space:]\"]/, "", $2); print $2; exit}' <<<"$output")
-  public=$(awk -F: '/PublicKey|Password/ {gsub(/[[:space:]\"]/, "", $2); print $2; exit}' <<<"$output")
+  private=$(awk -F: '{label=$1; gsub(/[[:space:]]/, "", label); if (label == "PrivateKey") {value=$2; gsub(/[[:space:]"]/, "", value); print value; exit}}' <<<"$output")
+  public=$(awk -F: '{label=$1; gsub(/[[:space:]]/, "", label); if (label == "PublicKey" || label == "Password" || label == "Password(PublicKey)") {value=$2; gsub(/[[:space:]"]/, "", value); print value; exit}}' <<<"$output")
   short_id=$(openssl rand -hex 4)
-  [[ -n "$private" && -n "$public" ]] || die "无法解析 Reality 密钥。"
+  [[ -n "$private" && -n "$public" ]] || { warn "无法解析 Reality 密钥。"; return 1; }
   jq -cn \
-    --argjson port "$port" --arg uuid "$uuid" --arg server_name "$server_name" \
+    --argjson port "$port" --arg uuid "$uuid" --arg server_name "$server_name" --argjson handshake_port "$handshake_port" \
     --arg private_key "$private" --arg public_key "$public" --arg short_id "$short_id" \
-    --arg path "$path" \
-    '{port:$port,uuid:$uuid,server_name:$server_name,private_key:$private_key,public_key:$public_key,short_id:$short_id}
+    --arg fingerprint "$fingerprint" --arg path "$path" \
+    '{port:$port,uuid:$uuid,server_name:$server_name,handshake_port:$handshake_port,fingerprint:$fingerprint,
+      private_key:$private_key,public_key:$public_key,short_id:$short_id}
      + (if $path == "" then {} else {path:$path} end)'
 }
 
 add_protocol() {
   local choice protocol_id port uuid password path server_name method record candidate
   local congestion key_bytes hopping_range hop_start hop_end obfs_password
+  local tls_enabled=false cipher=auto handshake_port=443 fingerprint=chrome
+  local vless_encryption='' up_mbps=0 down_mbps=0 bbr_profile=standard hy2_mode=auto
   printf '\n可安装协议：\n'
   local i id
   for i in {1..13}; do
@@ -816,10 +880,53 @@ add_protocol() {
       fi
       ;;
   esac
-  port=$(prompt_port)
-  uuid=$(new_uuid)
-  password=$(new_password)
-  path="/${uuid}-ws"
+  case "$protocol_id" in
+    sb-vless-ws|sb-vmess-ws|xr-vless-ws|xr-vmess-ws)
+      if confirm "为该 WebSocket 入站启用 TLS？（使用证书管理中的当前证书）"; then
+        if ! certificate_ready; then
+          warn "启用 WebSocket TLS 前必须先在“证书管理”中申请有效证书。"
+          return 1
+        fi
+        tls_enabled=true
+      else
+        info "WebSocket TLS 未启用；VLESS 明文入站只适合 Argo 回源或可信网络。"
+      fi
+      ;;
+  esac
+  case "$protocol_id" in
+    sb-vmess-ws|xr-vmess-ws)
+      printf '\nVMess 客户端载荷加密：\n  1) auto（推荐）\n  2) aes-128-gcm\n  3) chacha20-poly1305\n  4) none\n'
+      while true; do
+        choice=$(prompt "请选择" "1")
+        case "$choice" in
+          1) cipher=auto; break ;;
+          2) cipher=aes-128-gcm; break ;;
+          3) cipher=chacha20-poly1305; break ;;
+          4) cipher=none; break ;;
+          *) warn "无效选择。" ;;
+        esac
+      done
+      ;;
+  esac
+  case "$protocol_id" in
+    xr-vless-reality|xr-vless-ws|xr-vless-xhttp-reality)
+      if confirm "启用 Xray VLESS Encryption（要求客户端支持新的 mlkem768x25519 参数）？"; then
+        printf '\nVLESS Encryption 长期认证方式：\n  1) X25519（配置较短，兼容性优先）\n  2) ML-KEM-768（抗量子，配置较长）\n'
+        while true; do
+          choice=$(prompt "请选择" "1")
+          case "$choice" in
+            1) vless_encryption=$(generate_vless_encryption_record x25519) || return 1; break ;;
+            2) vless_encryption=$(generate_vless_encryption_record mlkem768) || return 1; break ;;
+            *) warn "无效选择。" ;;
+          esac
+        done
+      fi
+      ;;
+  esac
+  port=$(prompt_port) || return 1
+  uuid=$(new_uuid) || { warn "UUID 生成失败。"; return 1; }
+  password=$(new_password) || { warn "随机密码生成失败。"; return 1; }
+  path=$(new_transport_path) || { warn "随机路径生成失败。"; return 1; }
   case "$protocol_id" in
     sb-vless-reality|xr-vless-reality|xr-vless-xhttp-reality)
       while true; do
@@ -827,14 +934,40 @@ add_protocol() {
         is_valid_domain "$server_name" && break
         warn "请输入标准域名，不要带协议或路径。"
       done
+      while true; do
+        handshake_port=$(prompt "Reality 目标站 TLS 端口" "443")
+        is_valid_port "$handshake_port" && break
+        warn "端口必须为 1-65535。"
+      done
+      printf '\nReality 客户端指纹：\n  1) chrome（推荐）\n  2) firefox\n  3) edge\n  4) safari\n  5) randomized\n'
+      while true; do
+        choice=$(prompt "请选择" "1")
+        case "$choice" in
+          1) fingerprint=chrome; break ;;
+          2) fingerprint=firefox; break ;;
+          3) fingerprint=edge; break ;;
+          4) fingerprint=safari; break ;;
+          5) fingerprint=randomized; break ;;
+          *) warn "无效选择。" ;;
+        esac
+      done
       [[ "$protocol_id" == xr-vless-xhttp-reality ]] || path=''
-      [[ -z "$path" ]] || path=$(prompt_transport_path "XHTTP 路径" "/${uuid}-xhttp")
-      record=$(make_reality_record "$protocol_id" "$port" "$uuid" "$server_name" "$path")
+      [[ -z "$path" ]] || path=$(prompt_transport_path "XHTTP 路径" "$path")
+      record=$(make_reality_record "$protocol_id" "$port" "$uuid" "$server_name" \
+        "$handshake_port" "$fingerprint" "$path") || return 1
+      if [[ -n "$vless_encryption" ]]; then
+        record=$(jq -c --argjson values "$vless_encryption" '. + $values' <<<"$record") || return 1
+      fi
       ;;
     sb-vless-ws|sb-vmess-ws|xr-vless-ws|xr-vmess-ws)
       path=$(prompt_transport_path "WebSocket 路径" "$path")
       record=$(jq -cn --argjson port "$port" --arg uuid "$uuid" --arg path "$path" \
-        '{port:$port,uuid:$uuid,path:$path}')
+        --argjson tls "$tls_enabled" --arg cipher "$cipher" \
+        '{port:$port,uuid:$uuid,path:$path,tls:$tls}
+         + (if $cipher == "auto" then {} else {cipher:$cipher} end)') || return 1
+      if [[ -n "$vless_encryption" ]]; then
+        record=$(jq -c --argjson values "$vless_encryption" '. + $values' <<<"$record") || return 1
+      fi
       ;;
     sb-tuic)
       while true; do
@@ -848,9 +981,49 @@ add_protocol() {
       ;;
     sb-hysteria2)
       record=$(jq -cn --argjson port "$port" --arg password "$password" \
-        '{port:$port,password:$password}')
+        '{port:$port,password:$password,ignore_client_bandwidth:false}')
+      printf '\nHysteria2 拥塞/带宽策略：\n'
+      printf '  1) 自动协商（推荐；默认 BBR，客户端提供带宽时可用 Brutal）\n'
+      printf '  2) 强制 BBR（忽略客户端带宽提示，更公平稳定）\n'
+      printf '  3) Brutal 服务端带宽上限（必须准确填写链路能力）\n'
+      while true; do
+        choice=$(prompt "请选择" "1")
+        case "$choice" in
+          1) hy2_mode=auto; break ;;
+          2) hy2_mode=bbr; break ;;
+          3) hy2_mode=brutal; break ;;
+          *) warn "无效选择。" ;;
+        esac
+      done
+      if [[ "$hy2_mode" == bbr ]]; then
+        record=$(jq -c '.ignore_client_bandwidth = true' <<<"$record") || return 1
+      elif [[ "$hy2_mode" == brutal ]]; then
+        while true; do
+          up_mbps=$(prompt "服务端最大上行 Mbps" "100")
+          [[ "$up_mbps" =~ ^[0-9]+$ ]] && ((10#$up_mbps > 0 && 10#$up_mbps <= 100000)) && break
+          warn "请输入 1-100000 的整数。"
+        done
+        while true; do
+          down_mbps=$(prompt "服务端最大下行 Mbps" "100")
+          [[ "$down_mbps" =~ ^[0-9]+$ ]] && ((10#$down_mbps > 0 && 10#$down_mbps <= 100000)) && break
+          warn "请输入 1-100000 的整数。"
+        done
+        record=$(jq -c --argjson up "$up_mbps" --argjson down "$down_mbps" \
+          '.up_mbps = $up | .down_mbps = $down' <<<"$record") || return 1
+      fi
+      printf '\nHysteria2 BBR 配置：\n  1) standard（推荐）\n  2) conservative\n  3) aggressive\n'
+      while true; do
+        choice=$(prompt "请选择" "1")
+        case "$choice" in
+          1) bbr_profile=standard; break ;;
+          2) bbr_profile=conservative; break ;;
+          3) bbr_profile=aggressive; break ;;
+          *) warn "无效选择。" ;;
+        esac
+      done
+      record=$(jq -c --arg profile "$bbr_profile" '.bbr_profile = $profile' <<<"$record") || return 1
       if confirm "启用 Hysteria2 UDP 端口跳跃？"; then
-        hopping_range=$(prompt_hopping_range "$port")
+        hopping_range=$(prompt_hopping_range "$port") || return 1
         read -r hop_start hop_end <<<"$hopping_range"
         record=$(jq -c --argjson start "$hop_start" --argjson end "$hop_end" \
           '.port_hopping = {enabled:true,start:$start,end:$end}' <<<"$record")
@@ -877,6 +1050,7 @@ add_protocol() {
         esac
       done
       password=$(openssl rand -base64 "$key_bytes" | tr -d '\n')
+      [[ -n "$password" ]] || { warn "Shadowsocks 密钥生成失败。"; return 1; }
       record=$(jq -cn --argjson port "$port" --arg password "$password" --arg method "$method" \
         '{port:$port,password:$password,method:$method}')
       ;;
@@ -897,15 +1071,66 @@ add_protocol() {
 }
 
 installed_protocols() {
-  local ids id
+  local ids id details
   mapfile -t ids < <(jq -r '.protocols | keys[]' "$STATE_FILE")
   if ((${#ids[@]} == 0)); then
     printf '  （尚未安装协议）\n'
     return 0
   fi
   for id in "${ids[@]}"; do
-    printf '  - %-48s 端口 %s\n' "$(protocol_label "$id")" "$(jq -r --arg id "$id" '.protocols[$id].port' "$STATE_FILE")"
+    details=$(jq -r --arg id "$id" '
+      .protocols[$id] as $p
+      | [
+          (if ($id | endswith("-ws")) then (if $p.tls == true then "TLS" else "无 TLS" end) else empty end),
+          (if ($p.encryption // "none") != "none" then "VLESS Encryption" else empty end),
+          (if $p.port_hopping.enabled == true then "端口跳跃 " + ($p.port_hopping.start|tostring) + "-" + ($p.port_hopping.end|tostring) else empty end)
+        ] | join("，")' "$STATE_FILE")
+    [[ -z "$details" ]] || details=" [$details]"
+    printf '  - %-48s 端口 %s%s\n' "$(protocol_label "$id")" \
+      "$(jq -r --arg id "$id" '.protocols[$id].port' "$STATE_FILE")" "$details"
   done
+}
+
+configure_websocket_tls() {
+  local ids choice protocol_id current target candidate
+  mapfile -t ids < <(jq -r '.protocols | keys[] | select(endswith("-ws"))' "$STATE_FILE")
+  ((${#ids[@]} > 0)) || { warn "尚未安装 WebSocket 入站。"; return 1; }
+  printf '\nWebSocket 入站：\n'
+  local i
+  for i in "${!ids[@]}"; do
+    current=$(jq -r --arg id "${ids[$i]}" 'if .protocols[$id].tls == true then "TLS 已启用" else "TLS 未启用" end' "$STATE_FILE")
+    printf '  %d) %s（%s）\n' "$((i + 1))" "$(protocol_label "${ids[$i]}")" "$current"
+  done
+  printf '  0) 返回\n'
+  read -r -p "请选择 [0-${#ids[@]}]: " choice
+  [[ "$choice" == 0 ]] && return 0
+  [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#ids[@]})) \
+    || { warn "无效选择。"; return 1; }
+  protocol_id=${ids[$((choice - 1))]}
+  target=$(jq -r '.argo.target // ""' "$STATE_FILE")
+  if [[ "$target" == "$protocol_id" ]]; then
+    warn "该入站正在作为 Argo 回源。请先移除或改绑 Argo，再切换 TLS，以免隧道回源协议失配。"
+    return 1
+  fi
+  current=$(jq -r --arg id "$protocol_id" '.protocols[$id].tls == true' "$STATE_FILE")
+  if [[ "$current" == false ]] && ! certificate_ready; then
+    warn "启用 WebSocket TLS 前必须先在“证书管理”中申请有效证书。"
+    return 1
+  fi
+  candidate=$(mktemp)
+  jq --arg id "$protocol_id" --argjson tls "$([[ "$current" == true ]] && printf false || printf true)" \
+    '.protocols[$id].tls = $tls' "$STATE_FILE" >"$candidate"
+  if commit_candidate "$candidate"; then
+    if [[ "$current" == true ]]; then
+      ok "$(protocol_label "$protocol_id") 的 TLS 已禁用。"
+    else
+      ok "$(protocol_label "$protocol_id") 的 TLS 已启用。"
+    fi
+    show_nodes false
+  else
+    warn "TLS 切换后的配置未通过检查，已保留原配置。"
+  fi
+  rm -f -- "$candidate"
 }
 
 stop_argo_local() {
@@ -949,7 +1174,7 @@ remove_protocol() {
 }
 
 configure_hysteria2() {
-  local choice port candidate hopping_range hop_start hop_end obfs_password
+  local choice port candidate hopping_range hop_start hop_end obfs_password up_mbps down_mbps bbr_profile hy2_mode
   if ! jq -e '.protocols["sb-hysteria2"] != null' "$STATE_FILE" >/dev/null; then
     warn "尚未安装 Sing-box Hysteria2。"
     return 1
@@ -969,8 +1194,19 @@ configure_hysteria2() {
     else
       printf '  Salamander 混淆：未启用\n'
     fi
+    if jq -e '.protocols["sb-hysteria2"].ignore_client_bandwidth == true' "$STATE_FILE" >/dev/null; then
+      printf '  拥塞/带宽策略：强制 BBR（忽略客户端带宽提示）\n'
+    elif jq -e '.protocols["sb-hysteria2"].up_mbps != null and .protocols["sb-hysteria2"].down_mbps != null' "$STATE_FILE" >/dev/null; then
+      printf '  拥塞/带宽策略：Brutal 上限，上行 %s Mbps / 下行 %s Mbps\n' \
+        "$(jq -r '.protocols["sb-hysteria2"].up_mbps' "$STATE_FILE")" \
+        "$(jq -r '.protocols["sb-hysteria2"].down_mbps' "$STATE_FILE")"
+    else
+      printf '  拥塞/带宽策略：自动协商\n'
+    fi
+    printf '  BBR 配置：%s\n' "$(jq -r '.protocols["sb-hysteria2"].bbr_profile // "standard"' "$STATE_FILE")"
     printf '\n  1) 启用/修改端口跳跃范围\n  2) 禁用端口跳跃\n'
-    printf '  3) 启用/更换 Salamander 混淆密码\n  4) 禁用 Salamander 混淆\n  0) 返回\n'
+    printf '  3) 启用/更换 Salamander 混淆密码\n  4) 禁用 Salamander 混淆\n'
+    printf '  5) 修改拥塞/带宽策略\n  6) 修改 BBR 配置\n  0) 返回\n'
     read -r -p '请选择: ' choice
     case "$choice" in
       1)
@@ -1018,6 +1254,71 @@ configure_hysteria2() {
         fi
         rm -f -- "$candidate"
         ;;
+      5)
+        candidate=$(mktemp)
+        printf '\nHysteria2 拥塞/带宽策略：\n'
+        printf '  1) 自动协商（推荐；默认 BBR，客户端提供带宽时可用 Brutal）\n'
+        printf '  2) 强制 BBR（忽略客户端带宽提示）\n'
+        printf '  3) Brutal 服务端带宽上限\n'
+        while true; do
+          choice=$(prompt "请选择" "1")
+          case "$choice" in
+            1) hy2_mode=auto; break ;;
+            2) hy2_mode=bbr; break ;;
+            3) hy2_mode=brutal; break ;;
+            *) warn "无效选择。" ;;
+          esac
+        done
+        if [[ "$hy2_mode" == brutal ]]; then
+          while true; do
+            up_mbps=$(prompt "服务端最大上行 Mbps" "100")
+            [[ "$up_mbps" =~ ^[0-9]+$ ]] && ((10#$up_mbps > 0 && 10#$up_mbps <= 100000)) && break
+            warn "请输入 1-100000 的整数。"
+          done
+          while true; do
+            down_mbps=$(prompt "服务端最大下行 Mbps" "100")
+            [[ "$down_mbps" =~ ^[0-9]+$ ]] && ((10#$down_mbps > 0 && 10#$down_mbps <= 100000)) && break
+            warn "请输入 1-100000 的整数。"
+          done
+          jq --argjson up "$up_mbps" --argjson down "$down_mbps" \
+            '.protocols["sb-hysteria2"].ignore_client_bandwidth = false
+             | .protocols["sb-hysteria2"].up_mbps = $up
+             | .protocols["sb-hysteria2"].down_mbps = $down' \
+            "$STATE_FILE" >"$candidate"
+        elif [[ "$hy2_mode" == bbr ]]; then
+          jq '.protocols["sb-hysteria2"].ignore_client_bandwidth = true
+              | del(.protocols["sb-hysteria2"].up_mbps, .protocols["sb-hysteria2"].down_mbps)' \
+            "$STATE_FILE" >"$candidate"
+        else
+          jq '.protocols["sb-hysteria2"].ignore_client_bandwidth = false
+              | del(.protocols["sb-hysteria2"].up_mbps, .protocols["sb-hysteria2"].down_mbps)' \
+            "$STATE_FILE" >"$candidate"
+        fi
+        if commit_candidate "$candidate"; then
+          ok "Hysteria2 带宽设置已更新。"
+          show_nodes false
+        fi
+        rm -f -- "$candidate"
+        ;;
+      6)
+        printf '\nHysteria2 BBR 配置：\n  1) standard（推荐）\n  2) conservative\n  3) aggressive\n'
+        while true; do
+          choice=$(prompt "请选择" "1")
+          case "$choice" in
+            1) bbr_profile=standard; break ;;
+            2) bbr_profile=conservative; break ;;
+            3) bbr_profile=aggressive; break ;;
+            *) warn "无效选择。" ;;
+          esac
+        done
+        candidate=$(mktemp)
+        jq --arg profile "$bbr_profile" '.protocols["sb-hysteria2"].bbr_profile = $profile' \
+          "$STATE_FILE" >"$candidate"
+        if commit_candidate "$candidate"; then
+          ok "Hysteria2 BBR 配置已更新为 $bbr_profile。"
+        fi
+        rm -f -- "$candidate"
+        ;;
       0) return 0 ;;
       *) warn "无效选择。" ;;
     esac
@@ -1029,12 +1330,13 @@ protocol_menu() {
   while true; do
     printf '\n协议管理\n'
     installed_protocols
-    printf '\n  1) 安装协议\n  2) 卸载协议\n  3) Hysteria2 端口跳跃/混淆\n  0) 返回\n'
+    printf '\n  1) 安装协议\n  2) 卸载协议\n  3) Hysteria2 高级设置\n  4) WebSocket TLS 开关\n  0) 返回\n'
     read -r -p '请选择: ' choice
     case "$choice" in
       1) add_protocol || true ;;
       2) remove_protocol || true ;;
       3) configure_hysteria2 || true ;;
+      4) configure_websocket_tls || true ;;
       0) return 0 ;;
       *) warn "无效选择。" ;;
     esac
@@ -1267,25 +1569,37 @@ install_acme_client() {
     rm -rf -- "$ACME_HOME"
   fi
   tag=${SBX_ACME_VERSION:-}
-  [[ -n "$tag" ]] || tag=$(github_latest_tag acmesh-official/acme.sh)
+  if [[ -z "$tag" ]] && ! tag=$(github_latest_tag acmesh-official/acme.sh); then
+    warn "无法读取 acme.sh 最新版本。"
+    return 1
+  fi
   tmp=$(mktemp -d)
   archive="$tmp/acme.tar.gz"
   info "从 acme.sh 官方 GitHub 发布页下载 $tag"
-  secure_curl -o "$archive" "https://github.com/acmesh-official/acme.sh/archive/refs/tags/${tag}.tar.gz"
-  tar -xzf "$archive" -C "$tmp"
-  source_script=$(find "$tmp" -mindepth 2 -maxdepth 2 -type f -name acme.sh | head -n1)
-  [[ -n "$source_script" ]] || { rm -rf -- "$tmp"; die "acme.sh 发布包结构异常。"; }
+  if ! secure_curl -o "$archive" "https://github.com/acmesh-official/acme.sh/archive/refs/tags/${tag}.tar.gz"; then
+    rm -rf -- "$tmp"
+    warn "acme.sh 下载失败。"
+    return 1
+  fi
+  if ! tar -xzf "$archive" -C "$tmp"; then
+    rm -rf -- "$tmp"
+    warn "acme.sh 发布包解压失败。"
+    return 1
+  fi
+  source_script=$(find "$tmp" -mindepth 2 -maxdepth 2 -type f -name acme.sh -print -quit)
+  [[ -n "$source_script" ]] || { rm -rf -- "$tmp"; warn "acme.sh 发布包结构异常。"; return 1; }
   source_dir=${source_script%/*}
   if ! (
     cd "$source_dir"
     bash ./acme.sh --install --home "$ACME_HOME" --config-home "$ACME_CONFIG" --nocron --noprofile
   ); then
     rm -rf -- "$tmp"
-    die "acme.sh 安装失败。"
+    warn "acme.sh 安装失败。"
+    return 1
   fi
   rm -rf -- "$tmp"
-  [[ -x "$ACME_HOME/acme.sh" ]] || die "acme.sh 安装失败。"
-  write_acme_units_and_hooks
+  [[ -x "$ACME_HOME/acme.sh" ]] || { warn "acme.sh 安装失败。"; return 1; }
+  write_acme_units_and_hooks || return 1
   ok "acme.sh 已安装。"
 }
 
@@ -1363,7 +1677,7 @@ detect_public_certificate_ips() {
 issue_certificate_ip() {
   local detected raw normalized acme_primary client_identity current_server normalized_server identifiers_json ip
   local -a ips=() domain_args=()
-  install_acme_client
+  install_acme_client || return 1
   detected=$(detect_public_certificate_ips)
   [[ -n "$detected" ]] && info "检测到本机公网 IP：$detected"
   while true; do
@@ -1395,7 +1709,7 @@ issue_certificate_ip() {
 
 issue_certificate_standalone() {
   local domain
-  install_acme_client
+  install_acme_client || return 1
   while true; do
     domain=$(prompt "需要签发证书的域名")
     is_valid_domain "$domain" && break
@@ -1410,7 +1724,7 @@ issue_certificate_standalone() {
 
 issue_certificate_dns_cf() {
   local domain client_domain base_domain cf_token cf_account
-  install_acme_client
+  install_acme_client || return 1
   while true; do
     domain=$(prompt "需要签发证书的域名（可输入 *.example.com）")
     if [[ "$domain" == \*.* ]]; then
@@ -1521,9 +1835,32 @@ choose_argo_target() {
   printf '%s' "${ids[$((choice - 1))]}"
 }
 
-write_argo_unit_quick() {
-  local target=$1 port
+argo_origin_url() {
+  local target=$1 port scheme=http
   port=$(jq -r --arg id "$target" '.protocols[$id].port' "$STATE_FILE")
+  if jq -e --arg id "$target" '.protocols[$id].tls == true' "$STATE_FILE" >/dev/null; then
+    certificate_ready || { warn "该 WebSocket 入站启用了 TLS，但当前证书文件不可用。"; return 1; }
+    scheme=https
+  fi
+  printf '%s://localhost:%s' "$scheme" "$port"
+}
+
+argo_origin_request() {
+  local target=$1 server_name
+  if jq -e --arg id "$target" '.protocols[$id].tls == true' "$STATE_FILE" >/dev/null; then
+    server_name=$(jq -r '.certificate.domain' "$STATE_FILE")
+    jq -cn --arg server_name "$server_name" '{originServerName:$server_name}'
+  else
+    printf '{}'
+  fi
+}
+
+write_argo_unit_quick() {
+  local target=$1 origin_url origin_option=''
+  origin_url=$(argo_origin_url "$target") || return 1
+  if jq -e --arg id "$target" '.protocols[$id].tls == true' "$STATE_FILE" >/dev/null; then
+    origin_option=" --origin-server-name $(jq -r '.certificate.domain' "$STATE_FILE")"
+  fi
   : >"$LOG_DIR/argo.log"
   cat >"$SYSTEMD_DIR/sbx-argo.service" <<EOF
 [Unit]
@@ -1533,7 +1870,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$CF_BIN tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --loglevel info --logfile $LOG_DIR/argo.log --url http://localhost:$port
+ExecStart=$CF_BIN tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --loglevel info --logfile $LOG_DIR/argo.log$origin_option --url $origin_url
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
@@ -1597,9 +1934,9 @@ cf_api() {
 
 start_argo_quick_for_target() {
   local target=$1 candidate hostname i
-  [[ -x "$CF_BIN" ]] || install_cloudflared
+  [[ -x "$CF_BIN" ]] || install_cloudflared || return 1
   stop_argo_local
-  write_argo_unit_quick "$target"
+  write_argo_unit_quick "$target" || return 1
   systemctl enable --now sbx-argo.service >/dev/null
   info "正在等待 Cloudflare 分配临时域名（最多约 30 秒）……"
   hostname=''
@@ -1630,6 +1967,7 @@ install_argo_quick() {
     warn "当前为固定隧道；请先在隧道管理中移除固定隧道。"
     return 1
   }
+  [[ -x "$CF_BIN" ]] || install_cloudflared || return 1
   target=$(choose_argo_target) || return 1
   start_argo_quick_for_target "$target"
 }
@@ -1649,14 +1987,15 @@ upsert_cloudflare_dns() {
 }
 
 install_argo_fixed() {
-  local target account_id zone_id hostname tunnel_name api_token port base payload response tunnel_id tunnel_token config_payload dns_record_id candidate mode
+  local target account_id zone_id hostname tunnel_name api_token base payload response tunnel_id tunnel_token config_payload dns_record_id candidate mode
+  local origin_url origin_request
   mode=$(jq -r '.argo.mode' "$STATE_FILE")
   [[ "$mode" == off ]] || {
     warn "已有 Argo 隧道正在使用；请先移除，再创建固定隧道。"
     return 1
   }
+  [[ -x "$CF_BIN" ]] || install_cloudflared || return 1
   target=$(choose_argo_target) || return 1
-  [[ -x "$CF_BIN" ]] || install_cloudflared
   account_id=$(prompt "Cloudflare Account ID")
   zone_id=$(prompt "Cloudflare Zone ID")
   while true; do
@@ -1671,14 +2010,15 @@ install_argo_fixed() {
     || { warn "Account ID/Zone ID 应为 32 位十六进制。"; return 1; }
   is_safe_token "$api_token" || { warn "API Token 格式不安全。"; return 1; }
   [[ "$tunnel_name" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { warn "隧道名称仅允许字母、数字、下划线和连字符。"; return 1; }
-  port=$(jq -r --arg id "$target" '.protocols[$id].port' "$STATE_FILE")
+  origin_url=$(argo_origin_url "$target") || return 1
+  origin_request=$(argo_origin_request "$target") || return 1
   base="https://api.cloudflare.com/client/v4/accounts/$account_id/cfd_tunnel"
   payload=$(jq -cn --arg name "$tunnel_name" '{name:$name,config_src:"cloudflare"}')
   response=$(cf_api POST "$base" "$api_token" "$payload") || return 1
   tunnel_id=$(jq -r '.result.id' <<<"$response")
   [[ "$tunnel_id" =~ ^[0-9a-fA-F-]{36}$ ]] || { warn "Cloudflare 未返回有效 Tunnel ID。"; return 1; }
-  config_payload=$(jq -cn --arg host "$hostname" --arg service "http://localhost:$port" \
-    '{config:{ingress:[{hostname:$host,service:$service,originRequest:{}},{service:"http_status:404"}],originRequest:{}}}')
+  config_payload=$(jq -cn --arg host "$hostname" --arg service "$origin_url" --argjson origin_request "$origin_request" \
+    '{config:{ingress:[{hostname:$host,service:$service,originRequest:$origin_request},{service:"http_status:404"}],originRequest:{}}}')
   cf_api PUT "$base/$tunnel_id/configurations" "$api_token" "$config_payload" >/dev/null || {
     warn "隧道已创建但 ingress 写入失败。Tunnel ID：$tunnel_id"
     return 1
@@ -1708,7 +2048,7 @@ install_argo_fixed() {
 }
 
 rebind_argo() {
-  local mode target old_target hostname account_id tunnel_id api_token port payload candidate
+  local mode target old_target hostname account_id tunnel_id api_token payload candidate origin_url origin_request
   mode=$(jq -r '.argo.mode' "$STATE_FILE")
   [[ "$mode" != off ]] || { warn "尚未配置 Argo。"; return 1; }
   target=$(choose_argo_target) || return 1
@@ -1722,12 +2062,13 @@ rebind_argo() {
   hostname=$(jq -r '.argo.hostname' "$STATE_FILE")
   account_id=$(jq -r '.argo.account_id' "$STATE_FILE")
   tunnel_id=$(jq -r '.argo.tunnel_id' "$STATE_FILE")
-  port=$(jq -r --arg id "$target" '.protocols[$id].port' "$STATE_FILE")
+  origin_url=$(argo_origin_url "$target") || return 1
+  origin_request=$(argo_origin_request "$target") || return 1
   read -r -s -p 'Cloudflare API Token（Tunnel Write）: ' api_token
   printf '\n'
   is_safe_token "$api_token" || { warn "API Token 格式不安全。"; return 1; }
-  payload=$(jq -cn --arg host "$hostname" --arg service "http://localhost:$port" \
-    '{config:{ingress:[{hostname:$host,service:$service,originRequest:{}},{service:"http_status:404"}],originRequest:{}}}')
+  payload=$(jq -cn --arg host "$hostname" --arg service "$origin_url" --argjson origin_request "$origin_request" \
+    '{config:{ingress:[{hostname:$host,service:$service,originRequest:$origin_request},{service:"http_status:404"}],originRequest:{}}}')
   cf_api PUT "https://api.cloudflare.com/client/v4/accounts/$account_id/cfd_tunnel/$tunnel_id/configurations" \
     "$api_token" "$payload" >/dev/null || return 1
   unset api_token
@@ -1787,7 +2128,11 @@ argo_menu() {
       3) rebind_argo || true ;;
       4) argo_status ;;
       5) remove_argo || true ;;
-      6) install_cloudflared; systemctl try-restart sbx-argo.service || true ;;
+      6)
+        if install_cloudflared; then
+          systemctl try-restart sbx-argo.service || true
+        fi
+        ;;
       0) return 0 ;;
       *) warn "无效选择。" ;;
     esac
@@ -1839,8 +2184,10 @@ install_warp_package() {
   local repo_file system_keyring had_repo=0 had_keyring=0
   command -v apt-get >/dev/null 2>&1 || { warn "官方 cloudflare-warp 自动安装目前仅支持 Debian/Ubuntu。"; return 1; }
   if ! command -v gpg >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y gnupg
+    if ! apt-get update || ! apt-get install -y gnupg; then
+      warn "无法安装 Cloudflare 仓库所需的 GnuPG。"
+      return 1
+    fi
   fi
   # shellcheck disable=SC1091
   os_release=${SBX_OS_RELEASE_FILE:-/etc/os-release}
@@ -1902,6 +2249,8 @@ install_warp_package() {
     return 1
   fi
   rm -rf -- "$tmp"
+  command -v warp-cli >/dev/null 2>&1 \
+    || { warn "cloudflare-warp 已安装，但找不到 warp-cli。"; return 1; }
 }
 
 update_warp_port_state() {
@@ -1910,19 +2259,52 @@ update_warp_port_state() {
   jq --argjson port "$port" '.routing.socks_port = $port' "$STATE_FILE" >"$candidate"
   if commit_candidate "$candidate"; then
     ok "WARP SOCKS5 端口已写入所有内核配置：127.0.0.1:$port"
+    rm -f -- "$candidate"
+    return 0
   fi
   rm -f -- "$candidate"
+  warn "WARP SOCKS5 端口未能写入代理内核配置。"
+  return 1
+}
+
+warp_proxy_request() {
+  local port=$1 url=$2 output=$3 http_code
+  if ! http_code=$(curl --silent --show-error --connect-timeout 4 --max-time 8 \
+      --socks5-hostname "127.0.0.1:$port" --output "$output" --write-out '%{http_code}' \
+      "$url" 2>/dev/null); then
+    return 1
+  fi
+  [[ "$http_code" =~ ^[2-5][0-9][0-9]$ ]] || return 1
+  printf '%s' "$http_code"
 }
 
 verify_warp_proxy() {
-  local port=$1 trace
-  trace=$(curl --fail --silent --show-error --max-time 15 --socks5-hostname "127.0.0.1:$port" \
-    https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
-  if grep -q '^warp=on' <<<"$trace"; then
-    ok "WARP Local proxy 连通验证通过。"
-    return 0
-  fi
-  warn "WARP 已配置，但代理连通验证未通过。请查看 warp-cli status 与 warp-cli settings。"
+  local port=$1 attempts=${2:-1} attempt tmp http_code warp_state
+  is_valid_port "$port" || { warn "WARP SOCKS5 端口无效：$port"; return 1; }
+  tmp=$(mktemp -d)
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if http_code=$(warp_proxy_request "$port" https://www.cloudflare.com/cdn-cgi/trace "$tmp/trace"); then
+      warp_state=$(awk -F= '$1 == "warp" {gsub(/[[:space:]\r]/, "", $2); print tolower($2); exit}' "$tmp/trace")
+      rm -rf -- "$tmp"
+      case "$warp_state" in
+        on|plus) ok "WARP Local proxy 连通验证通过（warp=$warp_state）。" ;;
+        *)
+          ok "WARP Local proxy SOCKS5 数据通路验证通过（HTTP $http_code）。"
+          info "Cloudflare trace 未返回 warp=on/plus；Team/Gateway 策略可能修改或拦截该检测页，不再据此误报断线。"
+          ;;
+      esac
+      return 0
+    fi
+    if http_code=$(warp_proxy_request "$port" http://connectivity.cloudflareclient.com "$tmp/connectivity"); then
+      rm -rf -- "$tmp"
+      ok "WARP Local proxy SOCKS5 数据通路验证通过（Cloudflare 连通检查 HTTP $http_code）。"
+      info "HTTPS trace 未通过，可能受 Team/Gateway HTTP 策略或证书检查影响。"
+      return 0
+    fi
+    ((attempt < attempts)) && sleep 2
+  done
+  rm -rf -- "$tmp"
+  warn "WARP Local proxy 的 SOCKS5 实际请求失败。请查看 warp-cli status、warp-cli settings 与 Gateway 策略。"
   return 1
 }
 
@@ -1936,23 +2318,30 @@ prepare_warp_registration_reset() {
 
 install_warp_free() {
   local port
-  command -v warp-cli >/dev/null 2>&1 || install_warp_package
+  if ! command -v warp-cli >/dev/null 2>&1; then
+    install_warp_package || return 1
+  fi
   port=$(prompt "本机 SOCKS5 监听端口" "$(jq -r '.routing.socks_port' "$STATE_FILE")")
   is_valid_port "$port" || { warn "端口无效。"; return 1; }
   prepare_warp_registration_reset || return 1
-  write_warp_mdm_free "$port"
-  systemctl restart warp-svc
+  write_warp_mdm_free "$port" || { warn "WARP MDM 配置写入失败。"; return 1; }
+  systemctl restart warp-svc || { warn "warp-svc 重启失败。"; return 1; }
   sleep 2
-  warp-cli --accept-tos registration new
+  if ! warp-cli --accept-tos registration show >/dev/null 2>&1; then
+    warp-cli --accept-tos registration new \
+      || { warn "WARP 免费账户注册失败。"; return 1; }
+  fi
   warp-cli --accept-tos tunnel protocol set MASQUE || true
-  warp-cli --accept-tos connect
-  update_warp_port_state "$port"
-  verify_warp_proxy "$port" || true
+  warp-cli --accept-tos connect || { warn "WARP 连接命令失败。"; return 1; }
+  verify_warp_proxy "$port" 3 || return 1
+  update_warp_port_state "$port" || return 1
 }
 
 install_warp_zt() {
   local port organization client_id client_secret
-  command -v warp-cli >/dev/null 2>&1 || install_warp_package
+  if ! command -v warp-cli >/dev/null 2>&1; then
+    install_warp_package || return 1
+  fi
   port=$(prompt "本机 SOCKS5 监听端口" "$(jq -r '.routing.socks_port' "$STATE_FILE")")
   is_valid_port "$port" || { warn "端口无效。"; return 1; }
   organization=$(prompt "Zero Trust Team 名称")
@@ -1963,17 +2352,18 @@ install_warp_zt() {
   is_safe_token "$client_id" && is_safe_token "$client_secret" \
     || { warn "Service Token 格式不安全。"; return 1; }
   prepare_warp_registration_reset || return 1
-  write_warp_mdm_zt "$port" "$organization" "$client_id" "$client_secret"
+  write_warp_mdm_zt "$port" "$organization" "$client_id" "$client_secret" \
+    || { unset client_secret; warn "Zero Trust MDM 配置写入失败。"; return 1; }
   unset client_secret
-  systemctl restart warp-svc
+  systemctl restart warp-svc || { warn "warp-svc 重启失败。"; return 1; }
   sleep 4
   warp-cli --accept-tos mdm refresh >/dev/null 2>&1 || true
   warp-cli --accept-tos tunnel protocol set MASQUE || true
   warp-cli --accept-tos connect || true
-  update_warp_port_state "$port"
   warp-cli --accept-tos registration show || true
   warp-cli --accept-tos status || true
-  verify_warp_proxy "$port" || true
+  verify_warp_proxy "$port" 5 || return 1
+  update_warp_port_state "$port" || return 1
 }
 
 change_warp_port() {
@@ -1982,12 +2372,12 @@ change_warp_port() {
   port=$(prompt "新的 SOCKS5 端口" "$(jq -r '.routing.socks_port' "$STATE_FILE")")
   is_valid_port "$port" || { warn "端口无效。"; return 1; }
   sed -i "/<key>proxy_port<\/key>/{n;s#<integer>[0-9]*</integer>#<integer>$port</integer>#;}" \
-    /var/lib/cloudflare-warp/mdm.xml
-  systemctl restart warp-svc
+    /var/lib/cloudflare-warp/mdm.xml || { warn "WARP MDM 端口修改失败。"; return 1; }
+  systemctl restart warp-svc || { warn "warp-svc 重启失败。"; return 1; }
   warp-cli --accept-tos mdm refresh >/dev/null 2>&1 || true
   warp-cli --accept-tos connect || true
-  update_warp_port_state "$port"
-  verify_warp_proxy "$port" || true
+  verify_warp_proxy "$port" || return 1
+  update_warp_port_state "$port" || return 1
 }
 
 warp_status() {

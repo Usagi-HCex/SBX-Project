@@ -95,6 +95,9 @@ SHADOWSOCKS_2022_METHODS = {
 }
 
 TUIC_CONGESTION_CONTROLS = {"cubic", "new_reno", "bbr"}
+VMESS_CIPHERS = {"auto", "aes-128-gcm", "chacha20-poly1305", "none"}
+REALITY_FINGERPRINTS = {"chrome", "firefox", "edge", "safari", "randomized"}
+HYSTERIA2_BBR_PROFILES = {"conservative", "standard", "aggressive"}
 
 
 class StateError(ValueError):
@@ -149,11 +152,43 @@ def validate_state(state: dict[str, Any]) -> None:
             raise StateError(f"{protocol_id} missing: {', '.join(missing)}")
         if "path" in item and not re.fullmatch(r"/[A-Za-z0-9._~/-]{1,200}", str(item["path"])):
             raise StateError(f"invalid path for {protocol_id}")
+        if protocol_id.endswith("-ws") and not isinstance(item.get("tls", False), bool):
+            raise StateError(f"invalid WebSocket TLS flag for {protocol_id}")
+        if protocol_id in {"sb-vmess-ws", "xr-vmess-ws"} and item.get("cipher", "auto") not in VMESS_CIPHERS:
+            raise StateError(f"invalid VMess cipher for {protocol_id}")
+        if "reality" in protocol_id:
+            handshake_port = item.get("handshake_port", 443)
+            if not isinstance(handshake_port, int) or not 1 <= handshake_port <= 65535:
+                raise StateError(f"invalid Reality handshake port for {protocol_id}")
+            if item.get("fingerprint", "chrome") not in REALITY_FINGERPRINTS:
+                raise StateError(f"invalid Reality fingerprint for {protocol_id}")
+        has_vless_encryption = "decryption" in item or "encryption" in item
+        if has_vless_encryption:
+            if protocol_id not in {"xr-vless-reality", "xr-vless-ws", "xr-vless-xhttp-reality"}:
+                raise StateError(f"VLESS Encryption is only supported by Xray profiles: {protocol_id}")
+            if not isinstance(item.get("decryption"), str) or not item["decryption"]:
+                raise StateError(f"missing VLESS decryption for {protocol_id}")
+            if not isinstance(item.get("encryption"), str) or not item["encryption"]:
+                raise StateError(f"missing VLESS encryption for {protocol_id}")
+            if item.get("vless_encryption_auth", "x25519") not in {"x25519", "mlkem768"}:
+                raise StateError(f"invalid VLESS Encryption authentication for {protocol_id}")
         if protocol_id == "sb-tuic" and item.get("congestion_control", "bbr") not in TUIC_CONGESTION_CONTROLS:
             raise StateError("invalid TUIC congestion control")
         if protocol_id in DUAL_PROTOCOLS and item.get("method") not in SHADOWSOCKS_2022_METHODS:
             raise StateError(f"invalid Shadowsocks 2022 method for {protocol_id}")
         if protocol_id == "sb-hysteria2":
+            if not isinstance(item.get("ignore_client_bandwidth", False), bool):
+                raise StateError("invalid Hysteria2 ignore_client_bandwidth flag")
+            for field in ("up_mbps", "down_mbps"):
+                value = item.get(field)
+                if value is not None and (not isinstance(value, int) or not 1 <= value <= 100000):
+                    raise StateError(f"invalid Hysteria2 {field}")
+            if ("up_mbps" in item) != ("down_mbps" in item):
+                raise StateError("Hysteria2 bandwidth limits must be configured as a pair")
+            if item.get("ignore_client_bandwidth") and "up_mbps" in item:
+                raise StateError("Hysteria2 bandwidth limits conflict with forced BBR mode")
+            if item.get("bbr_profile", "standard") not in HYSTERIA2_BBR_PROFILES:
+                raise StateError("invalid Hysteria2 BBR profile")
             obfs = item.get("obfs")
             if obfs is not None:
                 if not isinstance(obfs, dict) or obfs.get("type") != "salamander" or not obfs.get("password"):
@@ -186,6 +221,11 @@ def validate_state(state: dict[str, Any]) -> None:
     if target and (target not in protocols or target not in ARGO_PROTOCOLS):
         raise StateError("Argo target is not an installed WebSocket protocol")
     certificate = state.get("certificate", {})
+    if any(
+        protocol_id in TLS_PROTOCOLS or item.get("tls") is True
+        for protocol_id, item in protocols.items()
+    ) and not certificate.get("domain"):
+        raise StateError("a certificate identity is required by a TLS inbound")
     if certificate.get("kind") == "ip":
         identifiers = certificate.get("identifiers")
         if not isinstance(identifiers, list):
@@ -251,7 +291,10 @@ def singbox_inbound(protocol_id: str, item: dict[str, Any], state: dict[str, Any
                     "server_name": item["server_name"],
                     "reality": {
                         "enabled": True,
-                        "handshake": {"server": item["server_name"], "server_port": 443},
+                        "handshake": {
+                            "server": item["server_name"],
+                            "server_port": item.get("handshake_port", 443),
+                        },
                         "private_key": item["private_key"],
                         "short_id": [item["short_id"]],
                     },
@@ -266,6 +309,12 @@ def singbox_inbound(protocol_id: str, item: dict[str, Any], state: dict[str, Any
                 "transport": {"type": "ws", "path": item["path"]},
             }
         )
+        if item.get("tls"):
+            base["tls"] = {
+                "enabled": True,
+                "certificate_path": cert_path,
+                "key_path": key_path,
+            }
     elif protocol_id == "sb-hysteria2":
         base.update(
             {
@@ -278,10 +327,16 @@ def singbox_inbound(protocol_id: str, item: dict[str, Any], state: dict[str, Any
                     "headers": {"content-type": "text/plain; charset=utf-8"},
                     "content": "Not Found",
                 },
+                "ignore_client_bandwidth": item.get("ignore_client_bandwidth", False),
+                "disable_path_mtu_discovery": False,
             }
         )
         if item.get("obfs"):
             base["obfs"] = item["obfs"]
+        if "up_mbps" in item:
+            base["up_mbps"] = item["up_mbps"]
+            base["down_mbps"] = item["down_mbps"]
+        base["bbr_profile"] = item.get("bbr_profile", "standard")
     elif protocol_id == "sb-tuic":
         base.update(
             {
@@ -290,7 +345,10 @@ def singbox_inbound(protocol_id: str, item: dict[str, Any], state: dict[str, Any
                     {"name": "sbx", "uuid": item["uuid"], "password": item["password"]}
                 ],
                 "congestion_control": item.get("congestion_control", "bbr"),
+                "auth_timeout": "3s",
                 "zero_rtt_handshake": False,
+                "heartbeat": "10s",
+                "disable_path_mtu_discovery": False,
                 "tls": {
                     "enabled": True,
                     "alpn": ["h3"],
@@ -304,6 +362,17 @@ def singbox_inbound(protocol_id: str, item: dict[str, Any], state: dict[str, Any
             {
                 "type": "anytls",
                 "users": [{"name": "sbx", "password": item["password"]}],
+                "padding_scheme": [
+                    "stop=8",
+                    "0=30-30",
+                    "1=100-400",
+                    "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
+                    "3=9-9,500-1000",
+                    "4=500-1000",
+                    "5=500-1000",
+                    "6=500-1000",
+                    "7=500-1000",
+                ],
                 "tls": {"enabled": True, "certificate_path": cert_path, "key_path": key_path},
             }
         )
@@ -363,7 +432,7 @@ def xray_inbound(protocol_id: str, item: dict[str, Any], state: dict[str, Any]) 
             "security": "reality",
             "realitySettings": {
                 "show": False,
-                "target": f"{item['server_name']}:443",
+                "target": f"{item['server_name']}:{item.get('handshake_port', 443)}",
                 "serverNames": [item["server_name"]],
                 "privateKey": item["private_key"],
                 "shortIds": [item["short_id"]],
@@ -376,7 +445,7 @@ def xray_inbound(protocol_id: str, item: dict[str, Any], state: dict[str, Any]) 
                 "protocol": "vless",
                 "settings": {
                     "clients": [{"id": item["uuid"], "flow": "xtls-rprx-vision"}],
-                    "decryption": "none",
+                    "decryption": item.get("decryption", "none"),
                 },
                 "streamSettings": stream,
             }
@@ -384,6 +453,8 @@ def xray_inbound(protocol_id: str, item: dict[str, Any], state: dict[str, Any]) 
     elif protocol_id in {"xr-vless-ws", "xr-vmess-ws"}:
         is_vless = "vless" in protocol_id
         client: dict[str, Any] = {"id": item["uuid"]}
+        if is_vless and item.get("decryption"):
+            client["flow"] = "xtls-rprx-vision"
         if not is_vless:
             client["alterId"] = 0
         base.update(
@@ -391,15 +462,21 @@ def xray_inbound(protocol_id: str, item: dict[str, Any], state: dict[str, Any]) 
                 "protocol": "vless" if is_vless else "vmess",
                 "settings": {
                     "clients": [client],
-                    **({"decryption": "none"} if is_vless else {}),
+                    **({"decryption": item.get("decryption", "none")} if is_vless else {}),
                 },
                 "streamSettings": {
                     "network": "ws",
-                    "security": "none",
+                    "security": "tls" if item.get("tls") else "none",
                     "wsSettings": {"path": item["path"]},
                 },
             }
         )
+        if item.get("tls"):
+            base["streamSettings"]["tlsSettings"] = {
+                "certificates": [
+                    {"certificateFile": cert_path, "keyFile": key_path}
+                ]
+            }
     elif protocol_id == "xr-trojan":
         base.update(
             {
@@ -481,9 +558,10 @@ def b64_text(value: str) -> str:
 
 
 def vmess_link(
-    item: dict[str, Any], host: str, name: str, argo_host: str | None = None
+    item: dict[str, Any], host: str, name: str, tls_name: str = "", argo_host: str | None = None
 ) -> str:
     address = argo_host or host
+    tls_enabled = bool(argo_host or item.get("tls"))
     payload = {
         "v": "2",
         "ps": name,
@@ -491,14 +569,14 @@ def vmess_link(
         "port": "443" if argo_host else str(item["port"]),
         "id": item["uuid"],
         "aid": "0",
-        "scy": "auto",
+        "scy": item.get("cipher", "auto"),
         "net": "ws",
         "type": "none",
-        "host": argo_host or "",
+        "host": argo_host or (tls_name if tls_enabled else ""),
         "path": item["path"],
-        "tls": "tls" if argo_host else "",
-        "sni": argo_host or "",
-        "alpn": "http/1.1" if argo_host else "",
+        "tls": "tls" if tls_enabled else "",
+        "sni": argo_host or (tls_name if tls_enabled else ""),
+        "alpn": "http/1.1" if tls_enabled else "",
     }
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return "vmess://" + base64.b64encode(raw.encode()).decode()
@@ -514,26 +592,31 @@ def share_link(protocol_id: str, item: dict[str, Any], state: dict[str, Any]) ->
         argo_host = str(argo["hostname"])
     host = host_for_uri(argo_host or server)
     port = 443 if argo_host else item["port"]
+    cert_domain = str(state.get("certificate", {}).get("domain", ""))
 
     if protocol_id in {"sb-vmess-ws", "xr-vmess-ws"}:
-        return vmess_link(item, server, name, argo_host)
+        return vmess_link(item, server, name, cert_domain, argo_host)
     if protocol_id in {"sb-vless-ws", "xr-vless-ws"}:
+        tls_enabled = bool(argo_host or item.get("tls"))
         params = {
-            "encryption": "none",
-            "security": "tls" if argo_host else "none",
+            "encryption": item.get("encryption", "none"),
+            "security": "tls" if tls_enabled else "none",
             "type": "ws",
             "path": item["path"],
         }
-        if argo_host:
-            params.update({"host": argo_host, "sni": argo_host, "alpn": "http/1.1"})
+        if item.get("encryption"):
+            params["flow"] = "xtls-rprx-vision"
+        if tls_enabled:
+            tls_server_name = argo_host or cert_domain
+            params.update({"host": tls_server_name, "sni": tls_server_name, "alpn": "http/1.1"})
         return f"vless://{item['uuid']}@{host}:{port}?{query(params)}#{fragment(name)}"
     if protocol_id in {"sb-vless-reality", "xr-vless-reality"}:
         params = {
-            "encryption": "none",
+            "encryption": item.get("encryption", "none"),
             "flow": "xtls-rprx-vision",
             "security": "reality",
             "sni": item["server_name"],
-            "fp": "chrome",
+            "fp": item.get("fingerprint", "chrome"),
             "pbk": item["public_key"],
             "sid": item["short_id"],
             "type": "tcp",
@@ -541,11 +624,11 @@ def share_link(protocol_id: str, item: dict[str, Any], state: dict[str, Any]) ->
         return f"vless://{item['uuid']}@{host}:{port}?{query(params)}#{fragment(name)}"
     if protocol_id == "xr-vless-xhttp-reality":
         params = {
-            "encryption": "none",
+            "encryption": item.get("encryption", "none"),
             "flow": "xtls-rprx-vision",
             "security": "reality",
             "sni": item["server_name"],
-            "fp": "chrome",
+            "fp": item.get("fingerprint", "chrome"),
             "pbk": item["public_key"],
             "sid": item["short_id"],
             "type": "xhttp",
@@ -553,7 +636,6 @@ def share_link(protocol_id: str, item: dict[str, Any], state: dict[str, Any]) ->
             "mode": "auto",
         }
         return f"vless://{item['uuid']}@{host}:{port}?{query(params)}#{fragment(name)}"
-    cert_domain = state.get("certificate", {}).get("domain", "")
     if protocol_id == "sb-hysteria2":
         params = {
             "security": "tls",
