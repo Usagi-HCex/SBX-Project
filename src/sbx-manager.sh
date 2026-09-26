@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="0.1.9"
+VERSION="0.2.0"
 ETC_DIR="${SBX_ETC_DIR:-/etc/sbx-manager}"
 STATE_FILE="$ETC_DIR/state.json"
 CERT_DIR="$ETC_DIR/certs"
@@ -72,6 +72,11 @@ is_valid_hostname_or_ip() {
 is_safe_token() {
   local value=${1:-}
   [[ -n "$value" && "$value" =~ ^[A-Za-z0-9._~+/=-]+$ ]]
+}
+
+is_cloudflare_tunnel_token() {
+  local value=${1:-}
+  [[ ${#value} -ge 40 && "$value" =~ ^eyJ[A-Za-z0-9._~+/=-]+$ ]]
 }
 
 is_valid_transport_path() {
@@ -1873,6 +1878,28 @@ argo_origin_request() {
   fi
 }
 
+show_token_binding_requirements() {
+  local target=$1 hostname=$2 origin_url server_name
+  origin_url=$(argo_origin_url "$target") || return 1
+  printf '\nCloudflare 面板中的 Published Application 应配置为：\n'
+  printf '  Public hostname：%s\n' "$hostname"
+  printf '  Service URL：   %s\n' "$origin_url"
+  if jq -e --arg id "$target" '.protocols[$id].tls == true' "$STATE_FILE" >/dev/null; then
+    server_name=$(jq -r '.certificate.domain' "$STATE_FILE")
+    printf '  Origin Server Name：%s\n' "$server_name"
+    printf '  TLS 验证：保持启用（不要打开 No TLS Verify）\n'
+  fi
+  printf '  本机绑定协议：%s\n' "$(protocol_label "$target")"
+  printf '\nToken 只能运行远程管理隧道，不能修改 Cloudflare 面板中的域名或 Service URL。\n'
+}
+
+write_argo_token_env() {
+  local tunnel_token=$1
+  is_cloudflare_tunnel_token "$tunnel_token" || return 1
+  printf 'TUNNEL_TOKEN=%s\n' "$tunnel_token" >"$SECRET_DIR/argo.env"
+  chmod 600 "$SECRET_DIR/argo.env"
+}
+
 write_argo_unit_quick() {
   local target=$1 origin_url origin_option=''
   origin_url=$(argo_origin_url "$target") || return 1
@@ -1903,6 +1930,7 @@ EOF
 }
 
 write_argo_unit_fixed() {
+  : >"$LOG_DIR/argo.log"
   cat >"$SYSTEMD_DIR/sbx-argo.service" <<EOF
 [Unit]
 Description=SBX Manager Cloudflare Named Tunnel
@@ -1912,7 +1940,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=$SECRET_DIR/argo.env
-ExecStart=$CF_BIN tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token \${ARGO_TOKEN}
+ExecStart=$CF_BIN tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --loglevel info --logfile $LOG_DIR/argo.log run
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
@@ -1981,13 +2009,79 @@ start_argo_quick_for_target() {
 install_argo_quick() {
   local target mode
   mode=$(jq -r '.argo.mode' "$STATE_FILE")
-  [[ "$mode" != fixed ]] || {
-    warn "当前为固定隧道；请先在隧道管理中移除固定隧道。"
+  [[ "$mode" != fixed && "$mode" != token ]] || {
+    warn "当前为固定隧道；请先在隧道管理中移除现有隧道。"
     return 1
   }
   [[ -x "$CF_BIN" ]] || install_cloudflared || return 1
   target=$(choose_argo_target) || return 1
   start_argo_quick_for_target "$target"
+}
+
+install_argo_token() {
+  local mode target hostname tunnel_token candidate
+  mode=$(jq -r '.argo.mode' "$STATE_FILE")
+  [[ "$mode" == off ]] || {
+    warn "已有 Argo 隧道正在使用；请先移除本地隧道，再导入面板 Token。"
+    return 1
+  }
+  [[ -x "$CF_BIN" ]] || install_cloudflared || return 1
+  target=$(choose_argo_target) || return 1
+  while true; do
+    hostname=$(prompt "面板中已配置的隧道域名（例如 proxy.example.com）") || return 1
+    is_valid_domain "$hostname" && break
+    warn "域名格式无效。"
+  done
+  show_token_binding_requirements "$target" "$hostname" || return 1
+  confirm "确认面板中的 Public hostname、Service URL 和 TLS 参数已按上方配置？" || return 0
+  read_secret tunnel_token 'Cloudflare Tunnel Token（eyJ 开头）: ' || return 1
+  printf '\n'
+  if ! is_cloudflare_tunnel_token "$tunnel_token"; then
+    unset tunnel_token
+    warn "Tunnel Token 格式无效；应粘贴面板安装命令中完整的 eyJ... Token。"
+    return 1
+  fi
+  stop_argo_local
+  if ! write_argo_token_env "$tunnel_token"; then
+    unset tunnel_token
+    warn "Tunnel Token 保存失败。"
+    return 1
+  fi
+  unset tunnel_token
+  if ! write_argo_unit_fixed; then
+    : >"$SECRET_DIR/argo.env"
+    warn "Token 隧道 systemd 服务写入失败。"
+    return 1
+  fi
+  if ! systemctl enable --now sbx-argo.service >/dev/null; then
+    stop_argo_local
+    : >"$SECRET_DIR/argo.env"
+    warn "Token 隧道启动失败，请检查 Token 是否仍然有效。"
+    return 1
+  fi
+  sleep 2
+  if ! systemctl is-active --quiet sbx-argo.service; then
+    systemctl --no-pager --full status sbx-argo.service 2>/dev/null || true
+    stop_argo_local
+    : >"$SECRET_DIR/argo.env"
+    warn "Token 隧道未保持运行；请检查 Token、网络和 Cloudflare 面板配置。"
+    return 1
+  fi
+  candidate=$(mktemp)
+  jq --arg target "$target" --arg hostname "$hostname" '
+    .argo = {mode:"token",target:$target,hostname:$hostname,tunnel_id:"",account_id:""}' \
+    "$STATE_FILE" >"$candidate"
+  if commit_candidate "$candidate"; then
+    ok "面板 Token 隧道已连接，并绑定到 $(protocol_label "$target")：$hostname"
+    show_nodes false
+  else
+    stop_argo_local
+    : >"$SECRET_DIR/argo.env"
+    warn "Token 隧道状态写入失败，已停止本地隧道。"
+    rm -f -- "$candidate"
+    return 1
+  fi
+  rm -f -- "$candidate"
 }
 
 upsert_cloudflare_dns() {
@@ -2047,13 +2141,21 @@ install_argo_fixed() {
   }
   response=$(cf_api GET "$base/$tunnel_id/token" "$api_token") || return 1
   tunnel_token=$(jq -r '.result' <<<"$response")
-  is_safe_token "$tunnel_token" || { warn "Cloudflare 返回了异常隧道令牌。"; return 1; }
-  printf 'ARGO_TOKEN=%s\n' "$tunnel_token" >"$SECRET_DIR/argo.env"
-  chmod 600 "$SECRET_DIR/argo.env"
+  if ! is_cloudflare_tunnel_token "$tunnel_token"; then
+    unset api_token tunnel_token
+    warn "Cloudflare 返回了异常隧道令牌。"
+    return 1
+  fi
+  write_argo_token_env "$tunnel_token" || {
+    unset api_token tunnel_token
+    warn "无法保存 Cloudflare 隧道令牌。"
+    return 1
+  }
   unset api_token tunnel_token
   stop_argo_local
-  write_argo_unit_fixed
-  systemctl enable --now sbx-argo.service >/dev/null
+  write_argo_unit_fixed || { warn "固定隧道 systemd 服务写入失败。"; return 1; }
+  systemctl enable --now sbx-argo.service >/dev/null \
+    || { warn "固定隧道启动失败。"; return 1; }
   candidate=$(mktemp)
   jq --arg target "$target" --arg hostname "$hostname" --arg tunnel_id "$tunnel_id" \
     --arg account_id "$account_id" --arg zone_id "$zone_id" --arg dns_record_id "$dns_record_id" '
@@ -2078,6 +2180,24 @@ rebind_argo() {
     return
   fi
   hostname=$(jq -r '.argo.hostname' "$STATE_FILE")
+  if [[ "$mode" == token ]]; then
+    show_token_binding_requirements "$target" "$hostname" || return 1
+    confirm "确认已在 Cloudflare 面板把该域名的 Service URL/TLS 参数改为上方内容？" || return 0
+    candidate=$(mktemp)
+    jq --arg target "$target" '.argo.target = $target' "$STATE_FILE" >"$candidate"
+    if commit_candidate "$candidate"; then
+      systemctl try-restart sbx-argo.service >/dev/null 2>&1 \
+        || warn "节点状态已更新，但 Token 隧道重启失败，请查看 Argo 日志。"
+      ok "面板 Token 隧道已重绑到 $(protocol_label "$target")。"
+      show_nodes false
+    else
+      warn "Token 隧道重绑后的本地状态未通过检查。"
+      rm -f -- "$candidate"
+      return 1
+    fi
+    rm -f -- "$candidate"
+    return 0
+  fi
   account_id=$(jq -r '.argo.account_id' "$STATE_FILE")
   tunnel_id=$(jq -r '.argo.tunnel_id' "$STATE_FILE")
   origin_url=$(argo_origin_url "$target") || return 1
@@ -2102,18 +2222,26 @@ remove_argo() {
   local mode account_id tunnel_id zone_id record_id api_token candidate
   mode=$(jq -r '.argo.mode' "$STATE_FILE")
   [[ "$mode" != off ]] || { info "Argo 未启用。"; return 0; }
-  if [[ "$mode" == fixed ]] && confirm "是否同时删除 Cloudflare 端的隧道和 DNS 记录？"; then
-    account_id=$(jq -r '.argo.account_id' "$STATE_FILE")
-    tunnel_id=$(jq -r '.argo.tunnel_id' "$STATE_FILE")
-    zone_id=$(jq -r '.argo.zone_id // empty' "$STATE_FILE")
-    record_id=$(jq -r '.argo.dns_record_id // empty' "$STATE_FILE")
-    read_secret api_token 'Cloudflare API Token（Tunnel Write + Zone DNS Edit）: ' || return 1
-    printf '\n'
-    is_safe_token "$api_token" || { warn "API Token 格式不安全。"; return 1; }
+  if [[ "$mode" == fixed ]]; then
+    if confirm "是否同时删除 Cloudflare 端的隧道和 DNS 记录？"; then
+      account_id=$(jq -r '.argo.account_id' "$STATE_FILE")
+      tunnel_id=$(jq -r '.argo.tunnel_id' "$STATE_FILE")
+      zone_id=$(jq -r '.argo.zone_id // empty' "$STATE_FILE")
+      record_id=$(jq -r '.argo.dns_record_id // empty' "$STATE_FILE")
+      read_secret api_token 'Cloudflare API Token（Tunnel Write + Zone DNS Edit）: ' || return 1
+      printf '\n'
+      is_safe_token "$api_token" || { warn "API Token 格式不安全。"; return 1; }
+      stop_argo_local
+      [[ -z "$record_id" ]] || cf_api DELETE "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records/$record_id" "$api_token" >/dev/null || true
+      cf_api DELETE "https://api.cloudflare.com/client/v4/accounts/$account_id/cfd_tunnel/$tunnel_id" "$api_token" >/dev/null || true
+      unset api_token
+    else
+      stop_argo_local
+    fi
+  elif [[ "$mode" == token ]]; then
+    warn "此操作只停止并移除本机 Token 连接，不会删除 Cloudflare 面板中的 Tunnel、域名或路由。"
+    confirm "确认仅移除本地 Token 隧道？" || return 0
     stop_argo_local
-    [[ -z "$record_id" ]] || cf_api DELETE "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records/$record_id" "$api_token" >/dev/null || true
-    cf_api DELETE "https://api.cloudflare.com/client/v4/accounts/$account_id/cfd_tunnel/$tunnel_id" "$api_token" >/dev/null || true
-    unset api_token
   else
     stop_argo_local
   fi
@@ -2126,8 +2254,15 @@ remove_argo() {
 }
 
 argo_status() {
+  local mode target hostname
   printf '\nArgo 配置：\n'
   jq -r '.argo | "  模式：" + .mode + "\n  目标：" + (.target // "") + "\n  域名：" + (.hostname // "") + "\n  Tunnel ID：" + (.tunnel_id // "")' "$STATE_FILE"
+  mode=$(jq -r '.argo.mode' "$STATE_FILE")
+  if [[ "$mode" == token ]]; then
+    target=$(jq -r '.argo.target' "$STATE_FILE")
+    hostname=$(jq -r '.argo.hostname' "$STATE_FILE")
+    show_token_binding_requirements "$target" "$hostname" || true
+  fi
   systemctl --no-pager --full status sbx-argo.service 2>/dev/null || true
 }
 
@@ -2136,17 +2271,19 @@ argo_menu() {
   while true; do
     printf '\nArgo 隧道管理\n'
     printf '  1) 创建/重建临时 Quick Tunnel\n'
-    printf '  2) 通过 Cloudflare API 创建固定隧道并配置 DNS\n'
-    printf '  3) 修改隧道绑定的 WebSocket 入站\n'
-    printf '  4) 查看状态\n  5) 停止并移除隧道\n  6) 更新 cloudflared\n  0) 返回\n'
+    printf '  2) 导入面板 Tunnel Token（eyJ...，不调用 API）\n'
+    printf '  3) 通过 Cloudflare API 创建固定隧道并配置 DNS\n'
+    printf '  4) 修改隧道绑定的 WebSocket 入站\n'
+    printf '  5) 查看状态\n  6) 停止并移除隧道\n  7) 更新 cloudflared\n  0) 返回\n'
     read_editable choice '请选择: ' || return 1
     case "$choice" in
       1) install_argo_quick || true ;;
-      2) install_argo_fixed || true ;;
-      3) rebind_argo || true ;;
-      4) argo_status ;;
-      5) remove_argo || true ;;
-      6)
+      2) install_argo_token || true ;;
+      3) install_argo_fixed || true ;;
+      4) rebind_argo || true ;;
+      5) argo_status ;;
+      6) remove_argo || true ;;
+      7)
         if install_cloudflared; then
           systemctl try-restart sbx-argo.service || true
         fi
@@ -2594,8 +2731,8 @@ uninstall_manager() {
   local argo_mode
   confirm "确认卸载 SBX Manager、代理内核和本地配置？此操作不会卸载 WARP" || return 0
   argo_mode=$(jq -r '.argo.mode' "$STATE_FILE")
-  if [[ "$argo_mode" == fixed ]]; then
-    warn "Cloudflare 端的固定隧道不会在此步骤删除；如需删除，请先用 Argo 管理菜单。"
+  if [[ "$argo_mode" == fixed || "$argo_mode" == token ]]; then
+    warn "Cloudflare 端的固定隧道、域名和路由不会在此步骤删除；如需处理，请先使用 Argo 管理菜单或 Cloudflare 面板。"
     confirm "仍然继续本地卸载？" || return 0
   fi
   for unit in sbx-sing-box.service sbx-xray.service sbx-argo.service sbx-firewall.service sbx-watchdog.timer sbx-acme-renew.timer; do

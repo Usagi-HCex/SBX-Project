@@ -317,6 +317,22 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn("security=tls", bound)
         self.assertNotIn("argo.example.com", direct)
 
+    def test_dashboard_token_argo_mode_exports_bound_host(self):
+        state = sample_state()
+        state["argo"] = {
+            "mode": "token",
+            "target": "xr-vless-ws",
+            "hostname": "token.example.com",
+            "tunnel_id": "",
+            "account_id": "",
+        }
+        GEN.validate_state(state)
+        nodes = GEN.build_nodes(state)
+        bound = next(line for line in nodes.splitlines() if line.startswith("vless://4444"))
+        direct = next(line for line in nodes.splitlines() if line.startswith("vmess://"))
+        self.assertIn("@token.example.com:443", bound)
+        self.assertNotIn("token.example.com", direct)
+
     def test_duplicate_ports_are_rejected(self):
         state = sample_state()
         state["protocols"]["xr-trojan"]["port"] = 24443

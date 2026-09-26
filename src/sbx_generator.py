@@ -215,7 +215,7 @@ def validate_state(state: dict[str, Any]) -> None:
     if not isinstance(socks_port, int) or not 1 <= socks_port <= 65535:
         raise StateError("invalid routing.socks_port")
     argo = state.get("argo", {})
-    if argo.get("mode", "off") not in {"off", "quick", "fixed"}:
+    if argo.get("mode", "off") not in {"off", "quick", "fixed", "token"}:
         raise StateError("invalid argo mode")
     target = argo.get("target", "")
     if target and (target not in protocols or target not in ARGO_PROTOCOLS):

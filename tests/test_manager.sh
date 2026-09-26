@@ -99,6 +99,17 @@ jq -n --arg cert "$cert_file" --arg key "$key_file" '
 [[ $(argo_origin_url sb-vmess-ws) == http://localhost:18080 ]]
 [[ $(argo_origin_request xr-vless-ws | jq -r '.originServerName') == origin.example.com ]]
 [[ $(argo_origin_request sb-vmess-ws | jq -c '.') == '{}' ]]
+token_binding=$(show_token_binding_requirements xr-vless-ws token.example.com)
+grep -F 'Public hostname：token.example.com' <<<"$token_binding" >/dev/null
+grep -F 'Service URL：   https://localhost:28080' <<<"$token_binding" >/dev/null
+grep -F 'Origin Server Name：origin.example.com' <<<"$token_binding" >/dev/null
+
+valid_tunnel_token='eyJhIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInQiOiIwMTIzNDU2NyJ9'
+is_cloudflare_tunnel_token "$valid_tunnel_token"
+if is_cloudflare_tunnel_token 'not-a-cloudflare-token'; then
+  printf 'invalid Cloudflare tunnel token was unexpectedly accepted\n' >&2
+  exit 1
+fi
 
 firewall_log="$tmp/firewall.log"
 iptables() {
@@ -119,6 +130,24 @@ systemctl() {
   printf '%s\n' "$*" >>"$service_log"
   return 0
 }
+
+SECRET_DIR="$tmp/secrets"
+LOG_DIR="$tmp/log"
+SYSTEMD_DIR="$tmp/systemd"
+CF_BIN='/usr/local/bin/cloudflared'
+mkdir -p "$SECRET_DIR" "$LOG_DIR" "$SYSTEMD_DIR"
+write_argo_token_env "$valid_tunnel_token"
+[[ $(stat -c '%a' "$SECRET_DIR/argo.env") == 600 ]]
+grep -Fx "TUNNEL_TOKEN=$valid_tunnel_token" "$SECRET_DIR/argo.env" >/dev/null
+write_argo_unit_fixed
+grep -F "EnvironmentFile=$SECRET_DIR/argo.env" "$SYSTEMD_DIR/sbx-argo.service" >/dev/null
+grep -F "ExecStart=$CF_BIN tunnel --no-autoupdate" "$SYSTEMD_DIR/sbx-argo.service" >/dev/null
+if grep -F -- '--token' "$SYSTEMD_DIR/sbx-argo.service" >/dev/null \
+  || grep -F -- "$valid_tunnel_token" "$SYSTEMD_DIR/sbx-argo.service" >/dev/null; then
+  printf 'Cloudflare tunnel token leaked into the systemd command line\n' >&2
+  exit 1
+fi
+
 sync_core_services unused 0 1
 if grep -F 'restart sbx-sing-box.service' "$service_log" >/dev/null; then
   printf 'unchanged Sing-box was unexpectedly restarted\n' >&2
@@ -213,5 +242,31 @@ if ((prompt_called != 0)); then
   printf 'WARP port was prompted after package installation failed\n' >&2
   exit 1
 fi
+
+STATE_FILE="$tmp/token-state.json"
+jq -n '{
+  certificate:{domain:"",fullchain:"",key:""},
+  protocols:{"xr-vless-ws":{port:28080,tls:false}},
+  argo:{mode:"off",target:"",hostname:"",tunnel_id:"",account_id:""}
+}' >"$STATE_FILE"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp/cloudflared"
+chmod 755 "$tmp/cloudflared"
+CF_BIN="$tmp/cloudflared"
+choose_argo_target() { printf 'xr-vless-ws'; }
+prompt() { printf 'token.example.com'; }
+confirm() { return 0; }
+read_secret() { printf -v "$1" '%s' "$valid_tunnel_token"; }
+stop_argo_local() { :; }
+sleep() { :; }
+show_nodes() { :; }
+commit_candidate() { cp "$1" "$STATE_FILE"; }
+cf_api() {
+  printf 'Token mode unexpectedly called the Cloudflare API\n' >&2
+  return 1
+}
+install_argo_token >/dev/null
+[[ $(jq -r '.argo.mode' "$STATE_FILE") == token ]]
+[[ $(jq -r '.argo.target' "$STATE_FILE") == xr-vless-ws ]]
+[[ $(jq -r '.argo.hostname' "$STATE_FILE") == token.example.com ]]
 
 printf 'Manager shell tests passed.\n'
