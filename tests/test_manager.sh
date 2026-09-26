@@ -9,6 +9,15 @@ source "$ROOT/src/sbx-manager.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 
+editable_value=''
+secret_value=''
+read_editable editable_value '' <<<'editable input'
+read_secret secret_value '' <<<'secret input'
+[[ "$editable_value" == 'editable input' ]]
+[[ "$secret_value" == 'secret input' ]]
+declare -f read_editable | grep -F 'builtin read -e -r' >/dev/null
+declare -f read_secret | grep -F 'builtin read -e -r -s' >/dev/null
+
 FIXTURE_ASSET="$tmp/source-asset"
 printf 'verified release payload\n' >"$FIXTURE_ASSET"
 fixture_digest=$(sha256sum "$FIXTURE_ASSET" | awk '{print $1}')

@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="0.1.8"
+VERSION="0.1.9"
 ETC_DIR="${SBX_ETC_DIR:-/etc/sbx-manager}"
 STATE_FILE="$ETC_DIR/state.json"
 CERT_DIR="$ETC_DIR/certs"
@@ -79,20 +79,38 @@ is_valid_transport_path() {
   [[ ${#value} -le 201 && "$value" =~ ^/[A-Za-z0-9._~/-]+$ ]]
 }
 
+read_editable() {
+  local variable=$1 message=${2:-}
+  if [[ -t 0 ]]; then
+    IFS= builtin read -e -r -p "$message" "$variable"
+  else
+    IFS= builtin read -r -p "$message" "$variable"
+  fi
+}
+
+read_secret() {
+  local variable=$1 message=${2:-}
+  if [[ -t 0 ]]; then
+    IFS= builtin read -e -r -s -p "$message" "$variable"
+  else
+    IFS= builtin read -r -s -p "$message" "$variable"
+  fi
+}
+
 prompt() {
   local message=$1 default=${2:-} answer
   if [[ -n "$default" ]]; then
-    read -r -p "$message [$default]: " answer
+    read_editable answer "$message [$default]: " || return 1
     printf '%s' "${answer:-$default}"
   else
-    read -r -p "$message: " answer
+    read_editable answer "$message: " || return 1
     printf '%s' "$answer"
   fi
 }
 
 confirm() {
   local message=$1 answer
-  read -r -p "$message [y/N]: " answer
+  read_editable answer "$message [y/N]: " || return 1
   [[ "$answer" =~ ^[Yy]$ ]]
 }
 
@@ -864,7 +882,7 @@ add_protocol() {
     printf '  %2d) %s\n' "$i" "$(protocol_label "$id")"
   done
   printf '   0) 返回\n'
-  read -r -p '请选择协议 [0-13]: ' choice
+  read_editable choice '请选择协议 [0-13]: ' || return 1
   [[ "$choice" == 0 ]] && return 0
   protocol_id=$(protocol_id_from_choice "$choice") || { warn "无效选择。"; return 1; }
   if jq -e --arg id "$protocol_id" '.protocols[$id] != null' "$STATE_FILE" >/dev/null; then
@@ -1102,7 +1120,7 @@ configure_websocket_tls() {
     printf '  %d) %s（%s）\n' "$((i + 1))" "$(protocol_label "${ids[$i]}")" "$current"
   done
   printf '  0) 返回\n'
-  read -r -p "请选择 [0-${#ids[@]}]: " choice
+  read_editable choice "请选择 [0-${#ids[@]}]: " || return 1
   [[ "$choice" == 0 ]] && return 0
   [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#ids[@]})) \
     || { warn "无效选择。"; return 1; }
@@ -1150,7 +1168,7 @@ remove_protocol() {
     printf '  %d) %s\n' "$((i + 1))" "$(protocol_label "${ids[$i]}")"
   done
   printf '  0) 返回\n'
-  read -r -p "请选择要卸载的协议 [0-${#ids[@]}]: " choice
+  read_editable choice "请选择要卸载的协议 [0-${#ids[@]}]: " || return 1
   [[ "$choice" == 0 ]] && return 0
   [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#ids[@]})) || { warn "无效选择。"; return 1; }
   protocol_id=${ids[$((choice - 1))]}
@@ -1207,7 +1225,7 @@ configure_hysteria2() {
     printf '\n  1) 启用/修改端口跳跃范围\n  2) 禁用端口跳跃\n'
     printf '  3) 启用/更换 Salamander 混淆密码\n  4) 禁用 Salamander 混淆\n'
     printf '  5) 修改拥塞/带宽策略\n  6) 修改 BBR 配置\n  0) 返回\n'
-    read -r -p '请选择: ' choice
+    read_editable choice '请选择: ' || return 1
     case "$choice" in
       1)
         hopping_range=$(prompt_hopping_range "$port")
@@ -1331,7 +1349,7 @@ protocol_menu() {
     printf '\n协议管理\n'
     installed_protocols
     printf '\n  1) 安装协议\n  2) 卸载协议\n  3) Hysteria2 高级设置\n  4) WebSocket TLS 开关\n  0) 返回\n'
-    read -r -p '请选择: ' choice
+    read_editable choice '请选择: ' || return 1
     case "$choice" in
       1) add_protocol || true ;;
       2) remove_protocol || true ;;
@@ -1404,7 +1422,7 @@ core_menu() {
     printf '  1) 安装/更新 Sing-box\n'
     printf '  2) 安装/更新 Xray\n'
     printf '  0) 返回\n'
-    read -r -p '请选择: ' choice
+    read_editable choice '请选择: ' || return 1
     case "$choice" in
       1) install_or_update_core sing-box || true ;;
       2) install_or_update_core xray || true ;;
@@ -1476,7 +1494,7 @@ route_menu() {
     current=$(jq -r '.routing | "模式=" + .mode + "，SOCKS5=127.0.0.1:" + (.socks_port|tostring)' "$STATE_FILE")
     printf '\n出站路由管理（当前：%s）\n' "$current"
     printf '  1) 全部切换为 direct 本机出站\n  2) 全部切换为 WARP SOCKS5 出站\n  0) 返回\n'
-    read -r -p '请选择: ' choice
+    read_editable choice '请选择: ' || return 1
     case "$choice" in
       1) set_route_mode direct || true ;;
       2) set_route_mode warp || true ;;
@@ -1746,7 +1764,7 @@ issue_certificate_dns_cf() {
     done
   fi
   register_acme_account || return 1
-  read -r -s -p 'Cloudflare API Token（需要 Zone DNS Edit）: ' cf_token
+  read_secret cf_token 'Cloudflare API Token（需要 Zone DNS Edit）: ' || return 1
   printf '\n'
   cf_account=$(prompt "Cloudflare Account ID")
   is_safe_token "$cf_token" || { warn "API Token 格式不安全。"; return 1; }
@@ -1802,7 +1820,7 @@ certificate_menu() {
     printf '  2) HTTP-01（80 端口）申请/替换域名证书\n'
     printf '  3) Cloudflare DNS-01 申请/替换域名或泛域名证书\n'
     printf '  4) 立即续期\n  5) 查看证书与自动续期状态\n  0) 返回\n'
-    read -r -p '请选择: ' choice
+    read_editable choice '请选择: ' || return 1
     case "$choice" in
       1) issue_certificate_ip || true ;;
       2) issue_certificate_standalone || true ;;
@@ -1830,7 +1848,7 @@ choose_argo_target() {
     printf '  %d) %s（端口 %s）\n' "$((i + 1))" "$(protocol_label "${ids[$i]}")" \
       "$(jq -r --arg id "${ids[$i]}" '.protocols[$id].port' "$STATE_FILE")" >&2
   done
-  read -r -p "请选择 [1-${#ids[@]}]: " choice
+  read_editable choice "请选择 [1-${#ids[@]}]: " || return 1
   [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#ids[@]})) || return 1
   printf '%s' "${ids[$((choice - 1))]}"
 }
@@ -2004,7 +2022,7 @@ install_argo_fixed() {
     warn "域名格式无效。"
   done
   tunnel_name=$(prompt "隧道名称" "sbx-$(hostname -s | tr -cd 'A-Za-z0-9_-')")
-  read -r -s -p 'Cloudflare API Token（Tunnel Write + Zone DNS Edit）: ' api_token
+  read_secret api_token 'Cloudflare API Token（Tunnel Write + Zone DNS Edit）: ' || return 1
   printf '\n'
   [[ "$account_id" =~ ^[0-9a-fA-F]{32}$ && "$zone_id" =~ ^[0-9a-fA-F]{32}$ ]] \
     || { warn "Account ID/Zone ID 应为 32 位十六进制。"; return 1; }
@@ -2064,7 +2082,7 @@ rebind_argo() {
   tunnel_id=$(jq -r '.argo.tunnel_id' "$STATE_FILE")
   origin_url=$(argo_origin_url "$target") || return 1
   origin_request=$(argo_origin_request "$target") || return 1
-  read -r -s -p 'Cloudflare API Token（Tunnel Write）: ' api_token
+  read_secret api_token 'Cloudflare API Token（Tunnel Write）: ' || return 1
   printf '\n'
   is_safe_token "$api_token" || { warn "API Token 格式不安全。"; return 1; }
   payload=$(jq -cn --arg host "$hostname" --arg service "$origin_url" --argjson origin_request "$origin_request" \
@@ -2089,7 +2107,7 @@ remove_argo() {
     tunnel_id=$(jq -r '.argo.tunnel_id' "$STATE_FILE")
     zone_id=$(jq -r '.argo.zone_id // empty' "$STATE_FILE")
     record_id=$(jq -r '.argo.dns_record_id // empty' "$STATE_FILE")
-    read -r -s -p 'Cloudflare API Token（Tunnel Write + Zone DNS Edit）: ' api_token
+    read_secret api_token 'Cloudflare API Token（Tunnel Write + Zone DNS Edit）: ' || return 1
     printf '\n'
     is_safe_token "$api_token" || { warn "API Token 格式不安全。"; return 1; }
     stop_argo_local
@@ -2121,7 +2139,7 @@ argo_menu() {
     printf '  2) 通过 Cloudflare API 创建固定隧道并配置 DNS\n'
     printf '  3) 修改隧道绑定的 WebSocket 入站\n'
     printf '  4) 查看状态\n  5) 停止并移除隧道\n  6) 更新 cloudflared\n  0) 返回\n'
-    read -r -p '请选择: ' choice
+    read_editable choice '请选择: ' || return 1
     case "$choice" in
       1) install_argo_quick || true ;;
       2) install_argo_fixed || true ;;
@@ -2345,8 +2363,8 @@ install_warp_zt() {
   port=$(prompt "本机 SOCKS5 监听端口" "$(jq -r '.routing.socks_port' "$STATE_FILE")")
   is_valid_port "$port" || { warn "端口无效。"; return 1; }
   organization=$(prompt "Zero Trust Team 名称")
-  read -r -p 'Service Token Client ID: ' client_id
-  read -r -s -p 'Service Token Client Secret: ' client_secret
+  read_editable client_id 'Service Token Client ID: ' || return 1
+  read_secret client_secret 'Service Token Client Secret: ' || return 1
   printf '\n'
   [[ "$organization" =~ ^[A-Za-z0-9-]{1,63}$ ]] || { warn "Team 名称格式无效。"; return 1; }
   is_safe_token "$client_id" && is_safe_token "$client_secret" \
@@ -2409,7 +2427,7 @@ warp_menu() {
     printf '  1) 安装/重配免费账户\n'
     printf '  2) 使用 Service Token + MDM 接入 Zero Trust\n'
     printf '  3) 修改 SOCKS5 端口\n  4) 查看与验证状态\n  5) 卸载 WARP\n  0) 返回\n'
-    read -r -p '请选择: ' choice
+    read_editable choice '请选择: ' || return 1
     case "$choice" in
       1) install_warp_free || true ;;
       2) install_warp_zt || true ;;
@@ -2496,7 +2514,7 @@ firewall_menu() {
   while true; do
     printf '\n防火墙管理\n'
     printf '  1) 查看 SBX 规则与云安全组需求\n  2) 从当前协议重新同步规则\n  0) 返回\n'
-    read -r -p '请选择: ' choice
+    read_editable choice '请选择: ' || return 1
     case "$choice" in
       1) firewall_status ;;
       2) sync_firewall "$STATE_FILE" && ok "防火墙规则已重新同步。" || true ;;
@@ -2511,7 +2529,7 @@ watchdog_menu() {
   while true; do
     printf '\nWatchdog：%s\n' "$(service_state sbx-watchdog.timer)"
     printf '  1) 启用（每 2 分钟）\n  2) 禁用\n  3) 立即健康检查\n  4) 查看最近日志\n  0) 返回\n'
-    read -r -p '请选择: ' choice
+    read_editable choice '请选择: ' || return 1
     case "$choice" in
       1)
         candidate=$(mktemp)
@@ -2543,7 +2561,7 @@ settings_menu() {
     printf '\n通用设置\n'
     printf '  1) 修改节点前缀\n  2) 修改节点服务器地址\n  3) Watchdog 管理\n'
     printf '  4) 防火墙管理\n  5) 重新生成并自检配置\n  0) 返回\n'
-    read -r -p '请选择: ' choice
+    read_editable choice '请选择: ' || return 1
     case "$choice" in
       1) set_prefix || true ;;
       2) set_server || true ;;
@@ -2559,7 +2577,7 @@ settings_menu() {
 logs_menu() {
   local choice unit
   printf '\n  1) Sing-box\n  2) Xray\n  3) Argo\n  4) WARP\n  5) Watchdog\n  0) 返回\n'
-  read -r -p '请选择日志: ' choice
+  read_editable choice '请选择日志: ' || return 1
   case "$choice" in
     1) unit=sbx-sing-box.service ;;
     2) unit=sbx-xray.service ;;
@@ -2609,7 +2627,7 @@ main_menu() {
     printf '  6) Cloudflare WARP 管理\n'
     printf '  7) direct / WARP 出站切换\n'
     printf '  8) 服务状态\n  9) 重启所有组件\n 10) 设置、Watchdog 与防火墙\n 11) 查看日志\n 12) 卸载管理器\n  0) 退出\n'
-    read -r -p '请选择 [0-12]: ' choice
+    read_editable choice '请选择 [0-12]: ' || return 0
     case "$choice" in
       1) protocol_menu ;;
       2) core_menu ;;
